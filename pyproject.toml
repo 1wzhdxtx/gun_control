@@ -1,0 +1,24 @@
+[project]
+name = "gunreg"
+version = "0.1.0"
+description = "基于区块链的民用枪支全链条智慧监管系统（后端实现）"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=42.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "playwright>=1.63.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

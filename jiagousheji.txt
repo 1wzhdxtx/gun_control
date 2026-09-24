@@ -1,0 +1,86 @@
+flowchart TB
+    subgraph FRONT["前端层 · Vue 3 + TypeScript"]
+        UI["监管、单位、从业人员、审计工作台"]
+        WEB["业务页面与共享组件"]
+        SDK["权限路由、状态管理、类型化 API 客户端"]
+        UI --> WEB --> SDK
+    end
+
+    subgraph ACCESS["接入隔离区"]
+        GW["WAF 与 API 网关：限流、请求检查"]
+        BFF["Web BFF：服务端会话、页面数据聚合"]
+        DG["设备网关：验签、防重放、协议转换"]
+        GW --> BFF
+    end
+
+    TERMINAL["场景终端：RFID、离线采集、扫码复核"]
+    SDK -->|"HTTPS"| GW
+    TERMINAL -->|"双向认证与签名事件"| DG
+
+    subgraph APP["应用区 · 模块化业务后端"]
+        API["应用接口：对象级授权、用例编排"]
+        DOMAIN["领域核心：生命周期、资格、审批携运、风险处置"]
+        QUERY["查询与取证：台账、统计、追溯、证据核验"]
+        API --> DOMAIN
+        API --> QUERY
+    end
+
+    BFF -->|"受控安全交换"| API
+    DG -->|"标准化事件与来源证明"| API
+
+    subgraph DATA["链下数据区 · 按所属主体隔离"]
+        DB[("业务数据库：模块私有数据与 Outbox")]
+        VIEW[("查询投影：可重建的台账与统计")]
+        LOCAL[("本地加密原件：身份、影像、生物特征")]
+    end
+
+    DOMAIN -->|"各模块自有仓储"| DB
+    QUERY -->|"授权查询"| VIEW
+
+    subgraph EVENT["异步处理区"]
+        RELAY["Outbox 转发器"]
+        MQ["事件总线：分类路由、重试、死信"]
+        ADAPTER["链适配器：提交、回执、幂等与对账"]
+        RELAY --> MQ
+        MQ -->|"待上链事件"| ADAPTER
+        ADAPTER -->|"确认回执"| MQ
+    end
+
+    DB --> RELAY
+    MQ -->|"确认结果与风险事件"| DOMAIN
+    MQ -->|"已确认事件"| QUERY
+    QUERY -->|"更新派生视图"| VIEW
+
+    subgraph CHAIN["联盟链区 · 准入控制与数据域隔离"]
+        CONTRACT["版本化智能合约：资格、多签、时空、流转、销毁"]
+        LEDGER[("共识账本：最小事件、摘要、签名、规则版本")]
+        CONTRACT --> LEDGER
+    end
+
+    ADAPTER -->|"签名交易"| CONTRACT
+    LEDGER -->|"交易回执与已确认事件"| ADAPTER
+
+    subgraph INTEGRATION["外部系统与本地数据适配"]
+        CONNECTOR["业务适配与隐私核验接口"]
+        LEGACY["全国枪管系统及协同部门系统"]
+        CONNECTOR <-->|"标准接口与签名结论"| LEGACY
+    end
+
+    DOMAIN --> CONNECTOR
+    QUERY --> CONNECTOR
+    CONNECTOR -->|"授权核验、最小披露"| LOCAL
+
+    subgraph SECURITY["贯穿各层的安全与运维"]
+        IAM["身份与权限：MFA、RBAC、ABAC"]
+        KEY["证书与密钥：CA、KMS、HSM"]
+        AUDIT["追加审计、监控告警、备份恢复"]
+    end
+
+    IAM -.-> BFF
+    IAM -.-> API
+    KEY -.-> DG
+    KEY -.-> ADAPTER
+    KEY -.-> LOCAL
+    API -.-> AUDIT
+    DG -.-> AUDIT
+    ADAPTER -.-> AUDIT

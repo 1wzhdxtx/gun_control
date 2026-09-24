@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>从业人员端 · 民用枪支区块链智慧监管</title>
+<link rel="stylesheet" href="/common.css">
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+<div id="root"></div>
+<script src="/common.js"></script>
+<script>
+async function boot() {
+  if (!await loadMe()) return;
+  const me = S.me;
+
+  const p1 = pane("我的档案", "持枪人数字档案（一人一档）· 证件资格动态核验");
+  p1.innerHTML = `<div class="grid c2">
+      <div class="card"><div id="pp-profile"></div></div>
+      <div class="card"><h3>资格状态模拟</h3>
+        <div class="row-actions">
+          <button id="q-renew" class="primary">证件续期</button>
+          <button id="q-suspend">暂停资格</button>
+          <button id="q-revoke" class="danger">吊销（模拟）</button>
+        </div>
+        <p style="margin-top:12px;color:var(--muted);font-size:12px">资格证书失效时，智能合约将阻止名下枪支继续流转，并触发紧急预警（资格退出的自动化回应）。</p>
+      </div></div>`;
+
+  const p2 = pane("名下枪支", "我当前持用的枪支及其状态");
+  p2.innerHTML = `<div class="card"><div id="mg-body"></div></div>`;
+
+  const p3 = pane("我的事件", "涉及本人的链上事件记录（哈希链序列）");
+  p3.innerHTML = `<div class="card"><div id="me-body"></div></div>`;
+
+  const tabs = [
+    { id: "profile", title: "我的档案", pane: p1, load: loadProfile },
+    { id: "guns", title: "名下枪支", pane: p2, load: loadMyGuns },
+    { id: "events", title: "我的事件", pane: p3, load: loadMyEvents },
+  ];
+  renderShell(tabs, "从业人员端 · 证件状态核验 / 记录查询");
+
+  document.getElementById("q-renew").onclick = () => qualify("valid", new Date(Date.now() + 3 * 365 * 864e5).toISOString());
+  document.getElementById("q-suspend").onclick = () => qualify("suspended", "");
+  document.getElementById("q-revoke").onclick = () => qualify("revoked", "");
+  switchTab("profile");
+}
+
+async function loadProfile() {
+  const p = S.me.person;
+  const box = document.getElementById("pp-profile");
+  if (!p) {
+    box.innerHTML = '<div class="empty">当前账号未关联人员档案</div>';
+    return;
+  }
+  const qual = p.cert_status;
+  box.innerHTML = "";
+  box.appendChild(el("h3", {}, "人员档案 " + p.name));
+  const grid = el("div", { class: "detail-grid" });
+  const rows = [
+    ["人员编号", mono(p.person_id)],
+    ["所属单位", p.unit_id],
+    ["岗位职责", p.duty],
+    ["证件载明枪种", (p.cert_kinds || []).join(" / ") || "-"],
+    ["资格状态", qual === "valid" ? badge("有效", "approved") : badge(qual, "emergency")],
+    ["证件有效期至", fmtTime(p.cert_expire)],
+  ];
+  for (const [k, v] of rows) {
+    grid.appendChild(el("span", { class: "k" }, k));
+    const cell = el("span", {});
+    if (v && typeof v === "object" && v.__html !== undefined) cell.innerHTML = v.__html;
+    else cell.textContent = (v === null || v === undefined) ? "-" : String(v);
+    grid.appendChild(cell);
+  }
+  box.appendChild(grid);
+}
+
+async function qualify(status, expire) {
+  try {
+    const r = await api("/api/qualify", { person_id: S.me.user.id, cert_status: status, cert_expire: expire });
+    ok("资格已更新", "当前状态 " + r.person.cert_status);
+    const m = await api("/api/me");
+    S.me.person = m.person;
+    loadProfile();
+  } catch (e) { err("更新失败", e.message); }
+}
+
+async function loadMyGuns() {
+  const d = await api("/api/my/guns");
+  renderTable(document.getElementById("mg-body"), [
+    { key: "gun_code", label: "整枪码", fmt: (v) => mono(v) },
+    { key: "status", label: "状态", fmt: (v) => gunBadge(v) },
+    { key: "unit_name", label: "所属单位", fmt: (v, r) => v || (typeof r.unit === "object" ? r.unit?.name : r.unit) || "-" },
+    { key: "last_event", label: "最后事件" },
+    { key: "last_ts", label: "最后时间", fmt: (v) => fmtTime(v) },
+  ], d.items, "当前名下无持用枪支");
+}
+
+async function loadMyEvents() {
+  const d = await api("/api/my/events");
+  renderTable(document.getElementById("me-body"), [
+    { key: "gun_code", label: "整枪码", fmt: (v) => mono(v) },
+    { key: "event_type", label: "事件", fmt: (v) => evBadge(v) },
+    { key: "occurred_at", label: "发生时间", fmt: (v) => fmtTime(v) },
+    { key: "actor", label: "操作主体" },
+    { key: "device_id", label: "采集设备", fmt: (v) => mono(v) },
+  ], d.items, "暂无事件；若名下有枪支，领用/归还/预警都会在此留下记录");
+}
+
+boot();
+</script>
+</body>
+</html>

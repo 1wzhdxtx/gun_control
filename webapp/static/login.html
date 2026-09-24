@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · 民用枪支区块链智慧监管演示台</title>
+<link rel="stylesheet" href="/common.css">
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-box">
+    <div class="login-hero">
+      <div class="login-brand">GUNREG / 智慧监管平台</div>
+      <h1>民用枪支全链条智慧监管</h1>
+      <p>让每一次流转有据可查。连接监管、单位、从业人员与审计的协同工作空间。</p>
+    </div>
+
+    <div class="login-grid">
+      <!-- 登录表单 -->
+      <div class="login-form">
+        <h2>账号登录</h2>
+        <div class="sub">欢迎使用演示工作台。选择演示身份，或输入账号与口令。</div>
+        <div class="field">
+          <label for="f-user">账号</label>
+          <input id="f-user" autocomplete="username" placeholder="如 admin1">
+        </div>
+        <div class="field">
+          <label for="f-pass">口令</label>
+          <input id="f-pass" type="password" autocomplete="current-password" placeholder="如 admin123">
+        </div>
+        <div class="field">
+          <label for="f-totp">动态口令（演示模式可留空）</label>
+          <input id="f-totp" inputmode="numeric" placeholder="6 位动态口令 / 可留空">
+        </div>
+        <div class="login-err" id="f-err" role="status" aria-live="polite"></div>
+        <button id="btn-login" class="primary" style="width:100%">进入工作台 →</button>
+        <div class="totp-hint">演示模式可仅使用账号与口令登录。动态口令显示在对应身份卡片中。</div>
+      </div>
+
+      <!-- 演示账号 -->
+      <div class="role-cards" id="cards"></div>
+    </div>
+    <div class="login-footer">一枪一码 · 一事一记 · 全程可追溯</div>
+  </div>
+</div>
+<script>
+const ACCOUNTS = [
+  { role: "admin", title: "监管工作台", desc: "公安机关 · 全量台账 / 运输审批 / 报废监督 / 预警处置 / 一链查证",
+    user_id: "admin1", password: "admin123" },
+  { role: "unit", title: "单位工作台", desc: "配置单位 · 领用归还（双人签名）/ 运输申报 / 维修 / 制造赋码",
+    user_id: "unit-rng", password: "unit123" },
+  { role: "practitioner", title: "从业人员端", desc: "持枪人 · 本人档案 / 名下枪支与事件 / 资格状态",
+    user_id: "rng-wang", password: "user123" },
+  { role: "auditor", title: "审计工作台", desc: "督察审计 · 审计日志 / 链上账本 / 证据核验 / 对账泵送",
+    user_id: "audit1", password: "audit123" },
+];
+const EXTRA = [
+  { name: "制造基地管理员", user_id: "unit-mfg", password: "unit123", role: "工场" },
+  { name: "运动学校管理员", user_id: "unit-spt", password: "unit123", role: "工场" },
+  { name: "从业人员 · 刘洋", user_id: "spt-liu", password: "user123", role: "持枪人" },
+];
+
+const errBox = document.getElementById("f-err");
+const userInp = document.getElementById("f-user");
+const passInp = document.getElementById("f-pass");
+const totpInp = document.getElementById("f-totp");
+const loginBtn = document.getElementById("btn-login");
+
+function fillAccount(user_id, password) {
+  userInp.value = user_id;
+  passInp.value = password;
+  totpInp.value = "";
+  errBox.textContent = "";
+  document.querySelectorAll(".role-card").forEach(card => card.classList.toggle("selected", card.dataset.account === user_id));
+  userInp.focus();
+}
+
+const cards = document.getElementById("cards");
+for (const a of ACCOUNTS) {
+  const card = document.createElement("div");
+  card.className = "role-card";
+  card.dataset.account = a.user_id;
+  card.innerHTML = `
+    <div class="rc-title">${a.title}</div>
+    <div class="rc-sub">${a.desc}</div>
+    <div class="acct">账号 <b>${a.user_id}</b>　口令 <b>${a.password}</b></div>
+    <div class="step">动态口令 <span class="totp-big" id="totp-${a.role}">······</span></div>
+    <button class="primary fill-btn" id="fill-${a.role}">使用此演示账号 →</button>`;
+  cards.appendChild(card);
+  document.getElementById("fill-" + a.role).addEventListener("click",
+    () => fillAccount(a.user_id, a.password));
+}
+const extraLine = document.createElement("div");
+extraLine.className = "extra-accounts";
+extraLine.innerHTML = "其他演示账号： " + EXTRA.map(e => `<span class="chip">${e.name} <b>${e.user_id}</b> / ${e.password}</span>`).join(" ");
+extraLine.style.textAlign = "center";
+cards.after(extraLine);
+
+async function refreshTotp() {
+  for (const a of ACCOUNTS) {
+    try {
+      const r = await fetch("/api/totp-demo?user_id=" + a.user_id).then(x => x.json());
+      const span = document.getElementById("totp-" + a.role);
+      span.textContent = r.code || "未启用";
+      span.classList.toggle("totp-low", r.remaining <= 10);
+      span.classList.toggle("totp-ok", r.remaining > 10);
+    } catch (e) {}
+  }
+}
+refreshTotp();
+setInterval(refreshTotp, 5000);
+
+async function doLogin() {
+  if (loginBtn.disabled) return;
+  const user_id = userInp.value.trim();
+  const password = passInp.value;
+  const totp = totpInp.value.trim();
+  if (!user_id || !password) {
+    errBox.textContent = "请输入账号和口令";
+    return;
+  }
+  loginBtn.disabled = true;
+  errBox.textContent = "登录中…";
+  try {
+    const resp = await fetch("/api/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id, password, totp }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.detail || "登录失败");
+    window.location.href = data.redirect || "/admin.html";
+  } catch (e) {
+    errBox.textContent = "登录失败：" + e.message;
+  } finally {
+    loginBtn.disabled = false;
+  }
+}
+loginBtn.addEventListener("click", doLogin);
+for (const id of ["f-user", "f-pass", "f-totp"]) {
+  document.getElementById(id).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doLogin();
+  });
+}
+</script>
+</body>
+</html>

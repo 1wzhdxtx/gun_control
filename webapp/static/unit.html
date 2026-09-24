@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>单位工作台 · 民用枪支区块链智慧监管</title>
+<link rel="stylesheet" href="/common.css">
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+<div id="root"></div>
+<script src="/common.js"></script>
+<script>
+const KIND_OPTIONS = ["手枪", "步枪", "猎枪", "运动步枪", "气手枪", "气步枪"];
+let PERSONS = [];
+
+async function boot() {
+  if (!await loadMe()) return;
+  const org = S.me.user.org;
+  let myUnit = null;
+  try { myUnit = (await api("/api/units")).items.find(u => u.unit_id === org); } catch (e) {}
+  const isMfg = myUnit && myUnit.unit_type === "manufacture";
+
+  PERSONS = (await api("/api/unit/persons")).items;
+
+  const p1 = pane("本部门台账", "本单位枪支台账 · 点击行查看链上时间线");
+  p1.innerHTML = `<div class="grid c2" style="margin-bottom:14px">
+      <div class="card">
+        <div class="form-row">
+          <div class="field"><label>状态筛选</label><select id="u-status"></select></div>
+          <div class="field" style="align-self:end"><button id="u-go" class="primary">查询</button></div>
+        </div>
+      </div></div>
+      <div class="card"><div id="ug-body"></div></div>
+      <div class="card" id="u-tl" style="display:none;margin-top:14px"><h3 id="u-tl-title"></h3><div id="u-tl-body"></div></div>`;
+
+  const p2 = pane("领用 / 归还", "双人签名（不同职责岗位）领用与归还，超时未归还将触发分级预警");
+  p2.innerHTML = `<div class="grid c2">
+      <div class="card"><h3>领用（出库）</h3>
+        <div id="co-form"></div><div id="co-out" style="margin-top:10px"></div></div>
+      <div class="card"><h3>归还（入柜）</h3>
+        <div id="ci-form"></div><div id="ci-out" style="margin-top:10px"></div></div>
+    </div>`;
+
+  const p3 = pane("运输申报", "运输许可闭环：申报 →（监管审批）→ 起运（车辆/承运绑定）→ 到达核销");
+  p3.innerHTML = `<div class="grid c2"><div class="card"><h3>申报运输许可</h3><div id="tp-form"></div></div>
+      <div class="card"><h3>起运（需已批准许可）</h3><div id="ts-form"></div></div></div>
+      <div class="card" style="margin-top:14px"><h3>本部门许可清单</h3><div id="tp-list"></div></div>`;
+
+  const p4 = pane("维修登记", "维修记录与更换散件上链，保养/维修与报废区分留痕");
+  p4.innerHTML = `<div class="card" style="max-width:640px"><h3>维修登记</h3><div id="rp-form"></div></div>
+      <div class="card" style="margin-top:14px"><div id="rp-out"></div></div>`;
+
+  const p5 = pane("人员与设备", "单位人员档案（签名主体）与感知设备登记");
+  p5.innerHTML = `<div class="grid c2">
+      <div class="card"><h3>人员档案</h3><div id="pp-form"></div><div id="pp-list" style="margin-top:12px"></div></div>
+      <div class="card"><h3>感知设备</h3><div id="pd-form"></div><div id="pd-list" style="margin-top:12px"></div></div>
+    </div>`;
+
+  const p6 = pane("制造赋码", "一枪一码 · 整枪码 + 散件码两级标识，制造时一次赋码，全生命周期不变");
+  p6.innerHTML = `<div class="card" style="max-width:720px"><h3>制造赋码</h3><div id="mf-form"></div>
+      <div id="mf-out" style="margin-top:12px"></div></div>`;
+
+  const p7 = pane("报废申报", "报废申请（含理由）与鉴定意见双人签名上链 → 监管省级确认 → 四节点销毁 → 封存");
+  p7.innerHTML = `<div class="grid c2">
+      <div class="card"><h3>申请报废（apply）</h3><div id="scp-form"></div></div>
+      <div class="card"><h3>提交鉴定（appraise）</h3><div id="sca-form"></div></div></div>
+      <div class="card" style="margin-top:14px"><h3>本单位报废流程进度</h3><div id="scp-list"></div></div>`;
+
+  const tabs = [
+    { id: "guns", title: "本部门台账", pane: p1, load: loadUnitGuns },
+    { id: "check", title: "领用 / 归还", pane: p2, load: loadCheckForms },
+    { id: "transport", title: "运输申报", pane: p3, load: loadTransport },
+    { id: "repair", title: "维修登记", pane: p4, load: loadRepair },
+    { id: "people", title: "人员与设备", pane: p5, load: loadPeople },
+    { id: "scrap", title: "报废申报", pane: p7, load: loadScrapApply },
+  ];
+  if (isMfg) tabs.push({ id: "manufacture", title: "制造赋码", pane: p6, load: loadManufacture });
+  renderShell(tabs, myUnit ? (myUnit.name + " · " + UNIT_TYPE[myUnit.unit_type]) : org);
+
+  const st = document.getElementById("u-status");
+  st.appendChild(new Option("全部状态", ""));
+  for (const k in GUN_STATUS) st.appendChild(new Option(GUN_STATUS[k], k));
+  document.getElementById("u-go").onclick = loadUnitGuns;
+  switchTab("guns");
+}
+
+/* ---------------- 本部门台账 ---------------- */
+async function loadUnitGuns() {
+  const status = document.getElementById("u-status").value;
+  const d = await api("/api/guns?status=" + encodeURIComponent(status));
+  renderTable(document.getElementById("ug-body"), [
+    { key: "gun_code", label: "整枪码", fmt: (v) => mono(v) },
+    { key: "status", label: "状态", fmt: (v) => gunBadge(v) },
+    { key: "holder", label: "持用人" },
+    { key: "last_event", label: "最后事件" },
+    { key: "last_ts", label: "最后时间", fmt: (v) => fmtTime(v) },
+  ], d.items.map(r => ({ ...r, link: () => showUnitTimeline(r.gun_code) })),
+    "暂无枪支");
+}
+
+async function showUnitTimeline(code) {
+  const panel = document.getElementById("u-tl");
+  panel.style.display = "block";
+  document.getElementById("u-tl-title").textContent = "时间线 · " + code;
+  try {
+    const d = await api("/api/gun/" + encodeURIComponent(code) + "/timeline");
+    makeTimelineTable("u-tl-body", d.items);
+  } catch (e) { err("加载失败", e.message); }
+}
+
+/* ---------------- 领用 / 归还 ---------------- */
+function personsSelect(id, pick) {
+  const sel = document.createElement("select");
+  sel.id = id;
+  for (const p of PERSONS) {
+    const o = new Option(`${p.name}（${p.duty}·${p.person_id}）`, p.person_id);
+    if (pick && p.person_id === pick) o.selected = true;
+    sel.appendChild(o);
+  }
+  return sel;
+}
+
+function makeSelect(id, options, selected) {
+  const sel = selectEl(options, selected);
+  sel.id = id;
+  return sel;
+}
+
+async function loadCheckForms() {
+  const guns = (await api("/api/guns")).items;
+  const inStock = guns.filter(g => g.status === "in_stock");
+  const inUse = guns.filter(g => g.status === "in_use");
+
+  // 领用
+  const co = document.getElementById("co-form");
+  co.innerHTML = "";
+  if (!inStock.length) {
+    co.appendChild(el("div", { class: "empty" }, "当前无在库枪支"));
+  } else {
+    let coGun = makeSelect("co-gun", inStock.map(g => [g.gun_code, g.gun_code]),
+      inStock[0].gun_code);
+    const usePersons = PERSONS.filter(p => p.duty === "使用");
+    const restPersons = PERSONS.filter(p => p.duty !== "使用");
+    let holderSel = makeSelect("co-holder",
+      usePersons.concat(restPersons).map(p => [p.person_id, p.name + "（" + p.duty + "）"]),
+      usePersons[0] && usePersons[0].person_id);
+    let s1 = personsSelect("co-s1", PERSONS.find(p => p.duty === "保管") && PERSONS.find(p => p.duty === "保管").person_id);
+    let s2 = personsSelect("co-s2", PERSONS.find(p => p.duty === "监督") && PERSONS.find(p => p.duty === "监督").person_id);
+    let dueSel = makeSelect("co-due", [[8, "8 小时"], [24, "24 小时"], [72, "72 小时"]], 8);
+    co.append(el("div", { class: "form-row" },
+      field("枪支（在库）", coGun),
+      field("持枪人", holderSel)));
+    co.append(el("div", { class: "form-row" }, field("归还时限", dueSel)));
+    co.append(el("div", { class: "form-row" },
+      field("签名人①（保管）", s1),
+      field("签名人②（监督）", s2)));
+    co.append(btnEl("领用（双人签名）", doCheckout, "primary"));
+  }
+
+  // 归还
+  const ci = document.getElementById("ci-form");
+  ci.innerHTML = "";
+  if (!inUse.length) { ci.appendChild(el("div", { class: "empty" }, "当前无领用中枪支")); }
+  else {
+    let ciGun = makeSelect("ci-gun",
+      inUse.map(g => [g.gun_code, g.gun_code + "（持用人 " + g.holder + "）"]),
+      inUse[0].gun_code);
+    let ciS1 = personsSelect("ci-s1", PERSONS.find(p => p.duty === "保管") && PERSONS.find(p => p.duty === "保管").person_id);
+    let ciS2 = personsSelect("ci-s2", PERSONS.find(p => p.duty === "监督") && PERSONS.find(p => p.duty === "监督").person_id);
+    ci.append(el("div", { class: "form-row" }, field("枪支（领用中）", ciGun)));
+    ci.append(el("div", { class: "form-row" },
+      field("签名人①（保管）", ciS1),
+      field("签名人②（监督）", ciS2)));
+    ci.append(btnEl("归还（双人签名）", doCheckin, "primary"));
+  }
+}
+
+async function doCheckout() {
+  const gun = $("co-gun").value;
+  const holder = $("co-holder").value;
+  const s1 = $("co-s1").value, s2 = $("co-s2").value;
+  const due = parseInt($("co-due").value, 10);
+  try {
+    const r = await api("/api/unit/checkout", {
+      gun_code: gun, person_id: holder,
+      signers: [[s1, "保管"], [s2, "监督"]],
+      due_hours: due,
+    });
+    ok("领用成功", gun + " → " + holder + "，应还时间 " + fmtTime(r.due_at));
+    loadCheckForms();
+  } catch (e) { err("领用被拒", e.message); }
+}
+
+async function doCheckin() {
+  const gun = $("ci-gun").value;
+  const s1 = $("ci-s1").value, s2 = $("ci-s2").value;
+  const gunRow = (await api("/api/guns")).items.find(g => g.gun_code === gun);
+  try {
+    await api("/api/unit/checkin", {
+      gun_code: gun, person_id: gunRow.holder,
+      signers: [[s1, "保管"], [s2, "监督"]],
+    });
+    ok("归还成功", gun + " 已入柜，状态回库");
+    loadCheckForms();
+  } catch (e) { err("归还被拒", e.message); }
+}
+
+/* ---------------- 运输申报 ---------------- */
+async function loadTransport() {
+  const guns = (await api("/api/guns")).items;
+  const available = guns.filter(g => g.status === "in_stock");
+  const permits = (await api("/api/permits")).items;
+
+  const tp = document.getElementById("tp-form");
+  tp.innerHTML = "";
+  let gunsSel = selectEl(available.map(g => [g.gun_code, g.gun_code]));
+  const tidy = (n, v) => { const i = inputEl(v); i.id = n; return i; };
+  const vehicle = tidy("tp-vehicle", "云A·T" + (1000 + Math.floor(Math.random() * 9000)));
+  const carrier = tidy("tp-carrier", "");
+  const escort = tidy("tp-escort", "");
+  const origin = tidy("tp-origin", "昆明制造基地");
+  const destination = tidy("tp-destination", "省级射击训练中心");
+  const validEnd = tidy("tp-end", new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 16));
+  tp.append(el("div", { class: "form-row" }, field("枪支清单（可多选）", gunsSel)));
+  tp.append(el("div", { class: "form-row" },
+    field("车辆", vehicle), field("承运人", carrier), field("押运人", escort)));
+  tp.append(el("div", { class: "form-row" },
+    field("起运地", origin), field("运往地", destination)));
+  tp.append(el("div", { class: "form-row" }, field("有效期至", validEnd)));
+  tp.append(btnEl("提交申报（待监管审批）", async () => {
+    const codes = [...gunsSel.selectedOptions].map(o => o.value);
+    if (!codes.length) return err("请选择枪支");
+    try {
+      await api("/api/permit/request", {
+        gun_codes: codes, vehicle: vehicle.value, carrier: carrier.value,
+        escort: escort.value, origin: origin.value, destination: destination.value,
+        valid_from: new Date(Date.now() - 3600e3).toISOString(),
+        valid_end: new Date(validEnd.value).toISOString(),
+      });
+      ok("申报成功", "等待监管工作台审批");
+      loadTransport();
+    } catch (e) { err("申报失败", e.message); }
+  }, "primary"));
+
+  const ts = document.getElementById("ts-form");
+  ts.innerHTML = "";
+  const approved = permits.filter(p => p.status === "approved");
+  if (!approved.length) {
+    ts.appendChild(el("div", { class: "empty" }, "暂无已批准许可"));
+  } else {
+    let pSel = selectEl(approved.map(p => [p.permit_id, p.permit_id + " · " + p.vehicle]), approved[0].permit_id);
+    const tsig = personsSelect("ts-sig", PERSONS.length && PERSONS[0].person_id);
+    ts.append(el("div", { class: "form-row" }, field("已批准许可", pSel)));
+    ts.append(el("div", { class: "form-row" }, field("承运方签名主体", tsig)));
+    ts.append(btnEl("起运（许可与车辆已绑定）", async () => {
+      const p = approved.find(x => x.permit_id === pSel.value);
+      try {
+        const r = await api("/api/permit/start", {
+          permit_id: p.permit_id, gun_codes: p.gun_codes, vehicle: p.vehicle,
+          carrier: p.carrier, escort: p.escort,
+        });
+        ok("已起运", p.permit_id + " 运输开始，枪支状态在途");
+        loadTransport();
+      } catch (e) { err("起运被拒", e.message); }
+    }, "primary"));
+  }
+
+  renderTable(document.getElementById("tp-list"), [
+    { key: "permit_id", label: "编号", fmt: (v) => mono(v) },
+    { key: "status", label: "状态", fmt: (v) => permitBadge(v) },
+    { key: "gun_codes", label: "涉枪", fmt: (v) => (v || []).length + " 支" },
+    { key: "vehicle", label: "车辆" },
+    { key: "route", label: "路线", fmt: (v, r) => `${r.origin} → ${r.destination}` },
+  ], permits, "暂无许可");
+}
+
+/* ---------------- 维修 ---------------- */
+async function loadRepair() {
+  const guns = (await api("/api/guns")).items;
+  const candidates = guns.filter(g => g.status === "in_stock" || g.status === "repairing");
+  const rp = document.getElementById("rp-form");
+  rp.innerHTML = "";
+  let gSel = selectEl(candidates.map(g => [g.gun_code, g.gun_code + "（" + GUN_STATUS[g.status] + "）"]),
+    candidates[0] && candidates[0].gun_code);
+  let aSel = selectEl(PERSONS.map(p => [p.person_id, p.name + "（" + p.duty + "）"]));
+  let sSel = selectEl(PERSONS.map(p => [p.person_id, p.name + "（" + p.duty + "）"]),
+    PERSONS[1] && PERSONS[1].person_id);
+  const content = inputEl("", "更换枪管并做精度校验");
+  content.id = "rp-content";
+  rp.append(el("div", { class: "form-row" }, field("枪支", gSel)));
+  rp.append(el("div", { class: "form-row" },
+    field("维修责任主体", aSel), field("复核签名人", sSel)));
+  rp.append(field("维修内容", content));
+  rp.append(btnEl("登记维修", async () => {
+    try {
+      await api("/api/unit/repair", {
+        gun_code: gSel.value, actor: aSel.value, content: content.value,
+        signers: [[aSel.value, "维修"], [sSel.value, "复核"]],
+      });
+      ok("维修已登记", content.value + "，记录上链");
+      loadRepair();
+    } catch (e) { err("维修被拒", e.message); }
+  }, "primary"));
+  const out = document.getElementById("rp-out");
+  out.innerHTML = "";
+  const hist = guns.filter(g => g.status === "repairing");
+  if (hist.length) renderTable(out, [
+    { key: "gun_code", label: "枪码", fmt: (v) => mono(v) },
+    { key: "status", label: "状态", fmt: v => gunBadge(v) },
+    { key: "last_event", label: "最后事件" },
+  ], hist, "维修历史见时间线");
+}
+
+/* ---------------- 人员与设备 ---------------- */
+async function loadPeople() {
+  const pp = document.getElementById("pp-form");
+  pp.innerHTML = "";
+  const pid = inputEl("p-001", "人员编号");
+  pid.id = "pp-id";
+  const name = inputEl("", "姓名"); name.id = "pp-name";
+  const duty = selectEl([["使用", "使用"], ["保管", "保管"], ["监督", "监督"]]);
+  const kinds = inputEl("手枪", "证件枪种，逗号分隔"); kinds.id = "pp-kinds";
+  const createLogin = el("input", { type: "checkbox", id: "pp-login" });
+  pp.append(el("div", { class: "form-row" },
+    field("编号", pid), field("姓名", name), field("岗位", duty)));
+  pp.append(el("div", { class: "form-row" }, field("证件载明枪种", kinds)));
+  pp.append(el("div", { class: "field" }, createLogin, " 同步开通 IAM 账号（口令 user123）"));
+  pp.append(btnEl("新增人员（登记入档）", async () => {
+    try {
+      await api("/api/unit/person", {
+        person_id: pid.value, name: name.value, duty: duty.value,
+        cert_kinds: kinds.value.split(/[,，]/).map(s => s.trim()).filter(Boolean),
+        create_login: createLogin.checked,
+      });
+      ok("已登记", pid.value + " · " + name.value);
+      PERSONS = (await api("/api/unit/persons")).items;
+      loadPeople();
+    } catch (e) { err("登记失败", e.message); }
+  }, "primary"));
+  renderTable(document.getElementById("pp-list"), [
+    { key: "person_id", label: "编号", fmt: v => mono(v) },
+    { key: "name", label: "姓名" },
+    { key: "duty", label: "岗位" },
+    { key: "cert_status", label: "资格", fmt: v => v === "valid" ? badge("有效", "approved") : badge(v, "emergency") },
+    { key: "cert_kinds", label: "证件枪种", fmt: v => (v || []).join(" / ") },
+  ], PERSONS, "暂无人员");
+
+  const pd = document.getElementById("pd-form");
+  pd.innerHTML = "";
+  const devId = inputEl("", "如 reader-gate-02"); devId.id = "pd-id";
+  const proto = selectEl([["rfid", "RFID 读写器"], ["scan", "扫码终端"], ["offline", "离线终端"]]);
+  pd.append(el("div", { class: "form-row" }, field("设备编号", devId), field("协议", proto)));
+  pd.append(btnEl("登记设备（颁发证书）", async () => {
+    try {
+      await api("/api/unit/device", { device_id: devId.value, protocol: proto.value });
+      ok("已登记", devId.value + " 已签名上链接入");
+      const d = await api("/api/unit/devices");
+      renderTable(document.getElementById("pd-list"), [
+        { key: "device_id", label: "设备", fmt: v => mono(v) },
+        { key: "protocol", label: "协议", fmt: v => v },
+        { key: "org", label: "所属" },
+      ], d.items, "暂无设备");
+    } catch (e) { err("登记失败", e.message); }
+  }, "primary"));
+  const d = await api("/api/unit/devices");
+  renderTable(document.getElementById("pd-list"), [
+    { key: "device_id", label: "设备", fmt: v => mono(v) },
+    { key: "protocol", label: "协议", fmt: v => v },
+    { key: "org", label: "所属" },
+  ], d.items, "暂无设备");
+}
+
+/* ---------------- 报废申报 ---------------- */
+const SCRAP_FLOW = ["apply", "appraise", "province_confirm", "destroy_submit",
+  "destroy_inventory", "destroy_execute", "destroy_archive"];
+const SCRAP_ZH = { apply: "申请", appraise: "鉴定", province_confirm: "省级确认",
+  destroy_submit: "送交", destroy_inventory: "清点", destroy_execute: "销毁",
+  destroy_archive: "影像留存·封存" };
+
+async function scrapNextStage(code) {
+  const tl = await api("/api/gun/" + encodeURIComponent(code) + "/timeline");
+  const done = (tl.items || []).filter(e => e.event_type === "scrap")
+    .map(e => (e.payload || {}).stage).filter(s => SCRAP_FLOW.includes(s));
+  return SCRAP_FLOW[done.length] || "apply";
+}
+
+async function loadScrapApply() {
+  const guns = (await api("/api/guns")).items;
+  const inStock = guns.filter(g => g.status === "in_stock");
+  const pending = guns.filter(g => g.status === "pending_destroy");
+  const keeper = PERSONS.find(p => p.duty === "保管");
+  const super2 = PERSONS.find(p => p.duty === "监督");
+
+  // 申请报废（apply）
+  const sp = document.getElementById("scp-form");
+  sp.innerHTML = "";
+  if (!inStock.length) {
+    sp.appendChild(el("div", { class: "empty" }, "当前无在库枪支可供申报"));
+  } else {
+    let gSel = selectEl(inStock.map(g => [g.gun_code, g.gun_code]), inStock[0].gun_code);
+    const reason = inputEl("", "报废理由（如 枪管磨损超差）"); reason.id = "scp-reason";
+    let s1 = personsSelect("scp-s1", keeper && keeper.person_id);
+    let s2 = personsSelect("scp-s2", super2 && super2.person_id);
+    sp.append(el("div", { class: "form-row" },
+      field("枪支（在库）", gSel), field("签名人①（保管）", s1), field("签名人②（监督）", s2)));
+    sp.append(el("div", { class: "form-row" }, field("报废理由", reason)));
+    sp.append(btnEl("提交申请（双人签名）", async () => {
+      if (!reason.value.trim()) return err("理由必填", "报废申请须载明理由");
+      try {
+        await api("/api/scrap", { gun_code: gSel.value, stage: "apply", reason: reason.value,
+          signers: [[s1.value, "保管"], [s2.value, "监督"]] });
+        ok("申请已上链", gSel.value + " 报废申请已提交，等待省级鉴定");
+        loadScrapApply();
+      } catch (e) { err("申请被拒", e.message); }
+    }, "primary"));
+  }
+
+  // 提交鉴定（appraise：仅允许已提交申请、下一节点为鉴定的枪）
+  const sa = document.getElementById("sca-form");
+  sa.innerHTML = "";
+  const ready = [];
+  for (const g of pending) {
+    try { if ((await scrapNextStage(g.gun_code)) === "appraise") ready.push(g); }
+    catch (e) { /* 时间线不可用时跳过 */ }
+  }
+  if (!ready.length) {
+    sa.appendChild(el("div", { class: "empty" }, "暂无待鉴定枪支（先提交报废申请）"));
+  } else {
+    let gSel = selectEl(ready.map(g => [g.gun_code, g.gun_code]), ready[0].gun_code);
+    const appraisal = inputEl("", "鉴定意见（如 膛线磨损超差，建议报废）"); appraisal.id = "sca-appraisal";
+    let s1 = personsSelect("sca-s1", keeper && keeper.person_id);
+    let s2 = personsSelect("sca-s2", super2 && super2.person_id);
+    sa.append(el("div", { class: "form-row" },
+      field("枪支（待鉴定）", gSel), field("签名人①（保管）", s1), field("签名人②（监督）", s2)));
+    sa.append(el("div", { class: "form-row" }, field("鉴定意见", appraisal)));
+    sa.append(btnEl("提交鉴定（双人签名）", async () => {
+      if (!appraisal.value.trim()) return err("意见必填", "鉴定须附具意见");
+      try {
+        await api("/api/scrap", { gun_code: gSel.value, stage: "appraise", appraisal: appraisal.value,
+          signers: [[s1.value, "保管"], [s2.value, "监督"]] });
+        ok("鉴定已上链", gSel.value + " 鉴定意见已记录");
+        loadScrapApply();
+      } catch (e) { err("鉴定被拒", e.message); }
+    }, "primary"));
+  }
+
+  // 进度列表
+  const rows = [];
+  for (const g of pending) {
+    let nxt = "apply";
+    try { nxt = await scrapNextStage(g.gun_code); } catch (e) { /* ignore */ }
+    rows.push({ gun_code: g.gun_code, next: nxt });
+  }
+  renderTable(document.getElementById("scp-list"), [
+    { key: "gun_code", label: "整枪码", fmt: (v) => mono(v) },
+    { key: "next", label: "下一节点", fmt: (v) => badge(SCRAP_ZH[v] || v,
+        v === "apply" ? "applied" : v === "appraise" ? "applied" : "approved") },
+  ], rows, "本单位暂无报废流程");
+}
+
+/* ---------------- 制造赋码 ---------------- */
+async function loadManufacture() {
+  const mf = document.getElementById("mf-form");
+  const nxt = await api("/api/unit/manufacture/next?kind=手枪");
+  mf.innerHTML = "";
+  const makerLbl = el("div", { class: "detail-grid", style: "margin-bottom:12px" },
+    el("span", { class: "k" }, "制造企业代码"), el("span", {}, nxt.maker));
+  const kind = selectEl(KIND_OPTIONS.map(k => [k, k]));
+  kind.id = "mf-kind";
+  const year = inputEl(String(new Date().getFullYear()), "制造年份"); year.id = "mf-year";
+  const serial = inputEl(String(nxt.next_serial), "生产流水号"); serial.id = "mf-serial";
+  kind.onchange = year.onchange = async () => {
+    const r = await api("/api/unit/manufacture/next?kind=" + encodeURIComponent(kind.value) +
+      "&year=" + year.value);
+    serial.value = r.next_serial;
+  };
+  mf.appendChild(makerLbl);
+  mf.append(el("div", { class: "form-row" },
+    field("枪种", kind), field("制造年份", year), field("生产流水号", serial)));
+  mf.append(btnEl("赋码入链", async () => {
+    try {
+      const r = await api("/api/unit/manufacture", {
+        kind: kind.value, year: parseInt(year.value), serial: parseInt(serial.value),
+      });
+      const g = r.gun;
+      const parts = (g.identity && g.identity.parts || []).join("，");
+      document.getElementById("mf-out").innerHTML =
+        `<div class="detail-grid">
+           <span class="k">整枪码</span><span class="mono">${esc(g.code)}</span>
+           <span class="k">现行枪号映射</span><span class="mono">${esc(g.identity.legacy_no)}</span>
+           <span class="k">状态</span><span>${gunBadge(g.status).__html}</span>
+           <span class="k">散件码</span><span class="mono" style="word-break:break-all">${esc(parts)}</span>
+         </div>`;
+      ok("赋码成功", g.code + " 已上链入库");
+      loadManufacture();
+    } catch (e) { err("赋码失败", e.message); }
+  }, "primary"));
+}
+
+boot();
+</script>
+</body>
+</html>

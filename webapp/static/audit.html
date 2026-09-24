@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>审计工作台 · 民用枪支区块链智慧监管</title>
+<link rel="stylesheet" href="/common.css">
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+<div id="root"></div>
+<script src="/common.js"></script>
+<script>
+async function boot() {
+  if (!await loadMe()) return;
+
+  const p1 = pane("审计日志", "全量追加式审计日志（哈希串联，可整体校验）");
+  p1.innerHTML = `<div class="row-actions" style="margin-bottom:14px">
+      <button id="al-verify" class="primary">校验审计链完整性</button>
+      <span id="al-verify-out"></span>
+    </div>
+    <div class="card"><div id="al-body"></div></div>`;
+
+  const p2 = pane("链上账本", "联盟链区块与交易（确定性共识 / 多签记账 / 哈希链）");
+  p2.innerHTML = `<div class="grid c3" style="margin-bottom:14px">
+      <div class="card"><h3>区块高度</h3><div class="kpi" id="lg-blocks">-</div></div>
+      <div class="card"><h3>链上交易</h3><div class="kpi ok" id="lg-txs">-</div></div>
+      <div class="card"><h3>账本校验</h3><div class="kpi" id="lg-verify">-</div></div>
+    </div>
+    <div class="card"><h3>区块明细</h3><div id="lg-blocks-body"></div></div>`;
+
+  const p3 = pane("证据核验", "单枪证据链核验：领域哈希链 / 链上覆盖 / 交易比对 / 规则版本");
+  p3.innerHTML = `<div class="grid c2">
+      <div class="card"><div id="ev-form"></div><div id="ev-checks" style="margin-top:12px"></div></div>
+      <div class="card"><h3>时间线</h3><div id="ev-tl"></div></div>
+    </div>`;
+
+  const p4 = pane("派生视图", "链下查询投影（可从链上事件全量重建）· 台账统计");
+  p4.innerHTML = `<div class="row-actions" style="margin-bottom:14px">
+      <button id="rb-rebuild" class="primary">从链上重建视图（rebuild）</button>
+      <button id="rb-stats">台账统计</button>
+      <span id="rb-out"></span>
+    </div>
+    <div class="card"><div id="rb-body"></div></div>`;
+
+  const p5 = pane("对账与泵送", "事务性 Outbox → 事件总线 → 链适配器 → 回执 的异步链路对账");
+  p5.innerHTML = `<div class="grid c3" style="margin-bottom:14px">
+      <div class="card"><h3>Outbox 待处理</h3><div class="kpi warn" id="ob-pending">-</div></div>
+      <div class="card"><h3>已发布 / 已确认回执</h3><div class="kpi ok" id="ob-acked">-</div></div>
+      <div class="card"><h3>死信队列</h3><div class="kpi" id="ob-dead">-</div></div>
+    </div>
+    <div class="row-actions" style="margin-bottom:14px">
+      <button id="ob-pump" class="primary">泵送（drain 全部）</button>
+      <button id="ob-reconcile">链上-链下对账</button>
+      <span id="ob-out"></span>
+    </div>
+    <div class="card"><h3>对账报告</h3><div id="ob-rep"></div></div>
+    <div class="card" style="margin-top:14px"><h3>Outbox 待处理队列</h3><div id="ob-queue"></div></div>`;
+
+  const tabs = [
+    { id: "auditlog", title: "审计日志", pane: p1, load: loadAuditLog },
+    { id: "ledger", title: "链上账本", pane: p2, load: loadLedger },
+    { id: "evidence", title: "证据核验", pane: p3, load: loadEvidence },
+    { id: "view", title: "派生视图", pane: p4, load: loadView },
+    { id: "outbox", title: "对账与泵送", pane: p5, load: loadOutbox },
+  ];
+  renderShell(tabs, "审计视角：只读全量 · 监督监管行为本身");
+
+  document.getElementById("al-verify").onclick = verifyAuditLog;
+  document.getElementById("rb-rebuild").onclick = rebuildView;
+  document.getElementById("rb-stats").onclick = loadViewStats;
+  document.getElementById("ob-pump").onclick = pump;
+  document.getElementById("ob-reconcile").onclick = reconcile;
+  switchTab("auditlog");
+}
+
+/* ---------------- 审计日志 ---------------- */
+async function loadAuditLog() {
+  const d = await api("/api/audit/log");
+  renderTable(document.getElementById("al-body"), [
+    { key: "seq", label: "序号" },
+    { key: "ts", label: "时间", fmt: (v) => fmtTime(v) },
+    { key: "actor", label: "主体", fmt: (v) => mono(v) },
+    { key: "action", label: "动作" },
+    { key: "target", label: "对象", fmt: (v) => mono(v) },
+    { key: "result", label: "结果", fmt: (v) => v === "ok" ? badge("OK", "approved") : badge(v, "emergency") },
+    { key: "hash", label: "审计哈希", fmt: (v) => monoTitle(v) },
+  ], d.items, "审计日志为空");
+}
+
+async function verifyAuditLog() {
+  try {
+    const r = await api("/api/audit/log/verify", {});
+    const out = document.getElementById("al-verify-out");
+    out.innerHTML = (r.ok ? badge("审计链完整 · " + esc(r.message), "approved")
+                          : badge("校验失败 · " + esc(r.message), "emergency")).__html;
+    ok(r.ok ? "审计链校验通过" : "审计链校验失败", r.message);
+  } catch (e) { err("校验失败", e.message); }
+}
+
+/* ---------------- 链上账本 ---------------- */
+async function loadLedger() {
+  const d = await api("/api/audit/ledger");
+  document.getElementById("lg-blocks").textContent = d.blocks.length;
+  document.getElementById("lg-txs").textContent = d.txs.length;
+  document.getElementById("lg-verify").textContent = "...";
+  renderTable(document.getElementById("lg-blocks-body"), [
+    { key: "height", label: "高度", fmt: (v) => ({ __html: `<span class="mono">#${esc(v)}</span>` }) },
+    { key: "ts", label: "出块时间", fmt: (v) => fmtTime(v) },
+    { key: "txs", label: "交易数", fmt: (v) => (v || []).length },
+    { key: "prev", label: "前序哈希", fmt: (v) => monoTitle(v) },
+    { key: "block_hash", label: "区块哈希", fmt: (v) => monoTitle(v) },
+  ], d.blocks, "账本为空");
+  const r = await api("/api/audit/ledger/verify", {});
+  document.getElementById("lg-verify").textContent = r.ok ? "通过" : "失败";
+}
+
+/* ---------------- 证据核验 ---------------- */
+async function loadEvidence() {
+  const form = document.getElementById("ev-form");
+  form.innerHTML = "";
+  const code = inputEl("", "整枪码 如 BFP20260000001");
+  code.id = "ev-code";
+  form.appendChild(el("div", { class: "form-row" },
+    field("整枪码", code),
+    el("div", { class: "field", style: "align-self:end" },
+      btnEl("核验", async () => {
+        const c = code.value.trim();
+        if (!c) return err("请输入整枪码");
+        try {
+          const rep = await api("/api/gun/" + encodeURIComponent(c) + "/evidence");
+          const labels = { hash_chain: "领域事件哈希链", ledger: "链上账本完整性",
+            coverage: "提交—上链对账", evidence_match: "事件哈希与交易比对",
+            rule_versions: "合约规则版本回溯" };
+          document.getElementById("ev-checks").innerHTML =
+            Object.entries(rep.checks).map(([k, ch]) =>
+              `<div class="detail-grid" style="padding:10px 0;border-bottom:1px solid rgba(34,52,92,.5)">
+                 <span class="k">${esc(labels[k] || k)}</span>
+                 <span>${(ch.ok ? badge("通过", "approved") : badge("失败", "emergency")).__html}
+                   <span style="color:var(--muted);font-size:12px">${esc(String(ch.detail ?? JSON.stringify(ch)))}</span></span>
+               </div>`).join("");
+          const tl = await api("/api/gun/" + encodeURIComponent(c) + "/timeline");
+          makeTimelineTable("ev-tl", tl.items);
+        } catch (e) { err("核验失败", e.message); }
+      }, "primary"))));
+}
+
+/* ---------------- 派生视图 ---------------- */
+async function loadView() {
+  const stats = await api("/api/audit/stats");
+  renderTable(document.getElementById("rb-body"), [
+    { key: "day", label: "统计日期" },
+    { key: "event_type", label: "事件类型", fmt: evBadge },
+    { key: "unit", label: "所属单位" },
+    { key: "cnt", label: "事件数" },
+  ], stats.slice().reverse().slice(0, 15), "暂无统计");
+}
+
+async function loadViewStats() {
+  await loadView();
+}
+
+async function rebuildView() {
+  try {
+    const r = await api("/api/audit/rebuild", {});
+    const out = document.getElementById("rb-out");
+    out.textContent = "已重建 " + r.rebuilt + " 条投影记录";
+    out.style.color = "var(--ok)";
+    ok("派生视图已重建", "从链上事件全量回放，共 " + r.rebuilt + " 条");
+    loadView();
+  } catch (e) { err("重建失败", e.message); }
+}
+
+/* ---------------- 对账与泵送 ---------------- */
+async function loadOutbox() {
+  const d = await api("/api/audit/outbox");
+  document.getElementById("ob-pending").textContent = d.outbox.pending || 0;
+  document.getElementById("ob-acked").textContent = d.outbox.published + " / " + d.receipts;
+  document.getElementById("ob-dead").textContent = d.outbox.dead + "（总线 " + d.bus.dead + "）";
+  document.getElementById("ob-rep").innerHTML =
+    `<div class="detail-grid">
+       <span class="k">总线已投递</span><span>${esc(d.bus.delivered)}</span>
+       <span class="k">总线失败</span><span>${esc(d.bus.failed)}</span>
+       <span class="k">链适配器对账</span><span class="mono">${esc(JSON.stringify(d.reconcile))}</span>
+     </div>`;
+  renderTable(document.getElementById("ob-queue"), [
+    { key: "id", label: "队列编号", fmt: mono },
+    { key: "topic", label: "主题" },
+    { key: "payload", label: "类型", fmt: (v) => evBadge(v?.event_type || "未知") },
+    { key: "created_at", label: "入队时间", fmt: (v) => fmtTime(v) },
+  ], d.queue, "Outbox 为空（全部已上链）");
+}
+
+async function pump() {
+  try {
+    const r = await api("/api/audit/pump", { rounds: 200 });
+    const out = document.getElementById("ob-out");
+    const published = typeof r.published === "object" ? r.published.published : r.published;
+    out.textContent = "本轮发布 " + published + " 条，回执累计 " + r.receipts;
+    out.style.color = "var(--ok)";
+    ok("泵送完成", "发布 " + published + " → 已确认回执 " + r.receipts);
+    loadOutbox();
+  } catch (e) { err("泵送失败", e.message); }
+}
+
+async function reconcile() {
+  const d = await api("/api/audit/outbox");
+  const rep = d.reconcile;
+  document.getElementById("ob-out").textContent = "对账完成：已提交 " + rep.submitted + " / 链上交易 " + rep.onchain + " / 缺失 " + rep.missing.length + " / 不一致 " + rep.mismatched.length;
+  document.getElementById("ob-out").style.color = rep.consistent ? "var(--ok)" : "var(--warn)";
+}
+
+boot();
+</script>
+</body>
+</html>

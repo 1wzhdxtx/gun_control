@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>监管工作台 · 民用枪支区块链智慧监管</title>
+<link rel="stylesheet" href="/common.css">
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+<div id="root"></div>
+<script src="/common.js"></script>
+<script>
+const SCRAP_STAGES = ["apply", "appraise", "province_confirm", "destroy_submit",
+  "destroy_inventory", "destroy_execute", "destroy_archive"];
+const SCRAP_LABEL = { apply: "申请", appraise: "鉴定", province_confirm: "省级确认",
+  destroy_submit: "送交", destroy_inventory: "清点", destroy_execute: "销毁",
+  destroy_archive: "影像留存·封存" };
+
+async function boot() {
+  if (!await loadMe()) return;
+  const p1 = pane("总览", "全量台账摘要、预警态势与演示时间（时限合约演示用）");
+  p1.innerHTML = `<div class="grid c3" id="ov-kpis"></div>
+    <div class="grid c2" style="margin-top:14px">
+      <div class="card"><h3>演示时钟推进</h3>
+        <div class="row-actions">
+          <button id="adv6">推进 +6h</button>
+          <button id="adv24">推进 +24h</button>
+          <button id="adv72">推进 +72h</button>
+        </div>
+        <p style="margin-top:10px;color:var(--muted);font-size:12px">推进后再到「预警中心」点击「扫描超期」，即可观察 提示→关注→紧急 三级预警联动。</p>
+      </div>
+      <div class="card"><h3>合约与账本</h3><div id="ov-contracts"></div></div>
+    </div>`;
+  const p2 = pane("枪支台账", "全量台账 · 一枪一码贯穿全生命周期，点击行查看链上时间线");
+  p2.innerHTML = `<div class="grid c2" style="margin-bottom:14px">
+      <div class="card">
+        <div class="form-row">
+          <div class="field"><label>状态筛选</label><select id="g-status"></select></div>
+          <div class="field"><label>单位</label><select id="g-unit"><option value="">全部单位</option></select></div>
+          <div class="field"><label>枪码搜索</label><input id="g-q" placeholder="整枪码或单位"></div>
+          <div class="field" style="align-self:end"><button id="g-go" class="primary">查询</button></div>
+        </div>
+      </div></div>
+      <div class="card"><div id="gl-body"></div></div>
+      <div class="card" id="tl-panel" style="display:none;margin-top:14px"><h3 id="tl-title"></h3><div id="tl-body"></div></div>`;
+  const p3 = pane("运输监管", "跨区域运输许可闭环：审批 → 起运（车辆/承运绑定）→ 到达核销");
+  p3.innerHTML = `<div class="card"><div id="pt-body"></div></div>`;
+  const p4 = pane("报废监督", "报废销毁四节点逐项上链：省级确认 → 送交 → 清点 → 销毁 → 影像封存（双人签名）");
+  p4.innerHTML = `<div class="grid c2">
+      <div class="card"><h3>待处理报废</h3><select id="sc-gun"></select>
+        <div id="sc-detail" style="margin-top:12px"></div></div>
+      <div class="card"><h3>销毁签名人（须≥2人）</h3><div id="sc-signers"></div>
+        <div class="row-actions" style="margin-top:12px" id="sc-actions"></div></div>
+    </div>`;
+  const p5 = pane("预警中心", "时限合约三级预警与处置闭环：扫描超期 → 升级 → 响应/闭环");
+  p5.innerHTML = `<div class="row-actions" style="margin-bottom:14px">
+      <button id="al-scan" class="primary">扫描超期</button>
+      <button id="al-esc">升级未响应预警</button>
+    </div>
+    <div class="card"><div id="al-body"></div></div>`;
+  const p6 = pane("一链查证", "责任倒查与证据核验：哈希链完整 / 链上覆盖 / 证据比对 / 规则版本回溯");
+  p6.innerHTML = `<div class="grid c2">
+      <div class="card"><div id="ev-form"></div><div id="ev-checks" style="margin-top:12px"></div></div>
+      <div class="card"><h3>该枪链上时间线</h3><div id="ev-tl"></div></div>
+    </div>`;
+
+  const tabs = [
+    { id: "overview", title: "总览", pane: p1, load: loadOverview },
+    { id: "guns", title: "枪支台账", pane: p2, load: loadGuns },
+    { id: "permits", title: "运输监管", pane: p3, load: loadPermits },
+    { id: "scrap", title: "报废监督", pane: p4, load: loadScrap },
+    { id: "alerts", title: "预警中心", pane: p5, load: loadAlerts },
+    { id: "evidence", title: "一链查证", pane: p6, load: loadEvidence },
+  ];
+  renderShell(tabs, "监管视角：全量台账 · 审批 · 取证");
+
+  document.getElementById("adv6").onclick = () => advance(6);
+  document.getElementById("adv24").onclick = () => advance(24);
+  document.getElementById("adv72").onclick = () => advance(72);
+  document.getElementById("g-go").onclick = loadGuns;
+  document.getElementById("al-scan").onclick = doScan;
+  document.getElementById("al-esc").onclick = doEscalate;
+
+  // 初始化状态筛选器
+  const st = document.getElementById("g-status");
+  st.appendChild(new Option("全部状态", ""));
+  for (const k in GUN_STATUS) st.appendChild(new Option(GUN_STATUS[k], k));
+  api("/api/units").then(u => {
+    const sel = document.getElementById("g-unit");
+    for (const it of u.items) sel.appendChild(new Option(`${it.name}`, it.unit_id));
+  });
+
+  switchTab("overview");
+}
+
+/* ---------------- 总览 ---------------- */
+async function loadOverview() {
+  const d = await api("/api/admin/overview");
+  const kpis = document.getElementById("ov-kpis");
+  kpis.innerHTML = "";
+  const cards = [
+    { label: "在册枪支", val: d.gun_total, cls: "" },
+    { label: "预警 · 提示", val: d.alert_by_level.hint || 0, cls: "warn" },
+    { label: "预警 · 关注", val: d.alert_by_level.concern || 0, cls: "warn" },
+    { label: "预警 · 紧急", val: d.alert_by_level.emergency || 0, cls: "danger" },
+    { label: "链上区块", val: d.ledger_blocks, cls: "ok" },
+    { label: "已确认回执", val: d.receipts, cls: "ok" },
+  ];
+  for (const c of cards) {
+    kpis.appendChild(el("div", { class: "card metric-card" },
+      el("span", { class: "metric-icon" }, icon(c.cls === "danger" || c.cls === "warn" ? "alerts" : c.cls === "ok" ? "ledger" : "guns")),
+      el("h3", {}, c.label),
+      el("div", { class: "kpi " + c.cls }, String(c.val)),
+      el("div", { class: "metric-note" }, c.label.startsWith("预警") ? "当前未闭环预警" : c.cls === "ok" ? "链上存证记录" : "全单位登记总量")));
+  }
+  const stBox = el("div", { class: "card", style: "grid-column:1/-1" });
+  stBox.appendChild(el("h3", {}, "当前状态分布"));
+  const palette = { in_stock: "#319c88", in_use: "#6491ce", in_transit: "#deb866", repairing: "#bf9a61", pending_destroy: "#cf7782", destroyed: "#8a98a8", sealed: "#8a98a8" };
+  const bar = el("div", { class: "distribution-bar", role: "img", "aria-label": "枪支状态分布" });
+  const dist = el("div", { class: "distribution" });
+  for (const [status, count] of Object.entries(d.by_status)) {
+    const color = palette[status] || "#8a98a8";
+    const label = (GUN_STATUS[status] || status) + " · " + count;
+    bar.appendChild(el("span", { style: `flex:${Number(count)};background:${color}`, title: label }));
+    dist.appendChild(el("div", { class: "distribution-item" },
+      el("span", { class: "distribution-dot", style: "background:" + color }),
+      GUN_STATUS[status] || status, el("strong", {}, String(count))));
+  }
+  bar.setAttribute("aria-label", Object.entries(d.by_status).map(([k,v]) => `${GUN_STATUS[k] || k} ${v}`).join("，"));
+  stBox.appendChild(bar);
+  stBox.appendChild(dist);
+  kpis.appendChild(stBox);
+  const names = { compliance: "资格与合规", spacetime: "时空约束", timelimit: "领用时限", multisig: "双人复核", transport_permit: "运输许可", scrap_confirm: "报废确认" };
+  document.getElementById("ov-contracts").innerHTML = d.contracts.map((c, i) =>
+    `<div class="contract-row"><span class="contract-number">${String(i + 1).padStart(2, "0")}</span>
+      <div><strong>${esc(names[c.name] || c.name)}</strong> <span class="chip">v${esc(c.version)}</span><p>${esc(c.rule_text)}</p></div></div>`).join("");
+}
+
+async function advance(hours) {
+  try {
+    const r = await api("/api/clock/advance", { hours });
+    ok("演示时钟已推进", "当前系统时间：" + fmtTime(r.now));
+    loadOverview();
+  } catch (e) { err("推进失败", e.message); }
+}
+
+/* ---------------- 枪支台账 ---------------- */
+async function loadGuns() {
+  const status = document.getElementById("g-status").value;
+  const unit = document.getElementById("g-unit").value;
+  const q = document.getElementById("g-q").value;
+  const d = await api("/api/guns?status=" + encodeURIComponent(status) +
+    "&unit=" + encodeURIComponent(unit) + "&q=" + encodeURIComponent(q));
+  renderTable(document.getElementById("gl-body"), [
+    { key: "gun_code", label: "整枪码", fmt: (v) => mono(v) },
+    { key: "status", label: "状态", fmt: (v) => gunBadge(v) },
+    { key: "holder", label: "当前持用人" },
+    { key: "unit", label: "所属单位", fmt: (v) => v || "-" },
+    { key: "last_event", label: "最后事件" },
+    { key: "last_ts", label: "最后时间", fmt: (v) => fmtTime(v) },
+  ], d.items.map(r => ({ ...r, link: () => showTimeline(r.gun_code) })),
+    "暂无枪支数据");
+}
+
+async function showTimeline(code) {
+  const panel = document.getElementById("tl-panel");
+  panel.style.display = "block";
+  document.getElementById("tl-title").textContent = "时间线 · " + code;
+  try {
+    const d = await api("/api/gun/" + encodeURIComponent(code) + "/timeline");
+    makeTimelineTable("tl-body", d.items);
+  } catch (e) { err("加载时间线失败", e.message); }
+}
+
+/* ---------------- 运输监管 ---------------- */
+async function loadPermits() {
+  const d = await api("/api/permits");
+  const body = document.getElementById("pt-body");
+  if (!d.items.length) { body.innerHTML = '<div class="empty">暂无运输许可</div>'; return; }
+  renderTable(body, [
+    { key: "permit_id", label: "许可编号", fmt: (v) => mono(v) },
+    { key: "status", label: "状态", fmt: (v) => permitBadge(v) },
+    { key: "gun_codes", label: "涉枪", fmt: (v) => (v || []).length + " 支" },
+    { key: "vehicle", label: "承运车辆", fmt: (v) => v || "-" },
+    { key: "carrier", label: "承运人" },
+    { key: "route", label: "起运地 → 运往地", fmt: (v, r) => `${r.origin} → ${r.destination}` },
+    { key: "actions", label: "操作", fmt: (v, r) => {
+        const btns = [];
+        if (r.status === "applied") btns.push(`<button class="sm primary" data-a="approve" data-id="${esc(r.permit_id)}">审批</button>`);
+        if (r.status === "in_transit") btns.push(`<button class="sm primary" data-a="verify" data-id="${esc(r.permit_id)}">到达核销</button>`);
+        return { __html: btns.join(" ") };
+      } },
+  ], d.items);
+  body.querySelectorAll("[data-a]").forEach(b => b.addEventListener("click", async () => {
+    const act = b.dataset.a, pid = b.dataset.id;
+    if (act === "approve") {
+      await api("/api/permit/approve", { permit_id: pid });
+      ok("已审批", pid + " 批准，可由单位起运");
+    } else {
+      await api("/api/permit/verify", { permit_id: pid });
+      ok("已核销", pid + " 到达确认，枪支回到在库");
+    }
+    loadPermits();
+  }));
+}
+
+/* ---------------- 报废监督 ---------------- */
+let scrapDone = [];
+async function loadScrap() {
+  const sel = document.getElementById("sc-gun");
+  const was = sel.value;
+  const d = await api("/api/guns?status=pending_destroy");
+  sel.innerHTML = "";
+  for (const g of d.items) sel.appendChild(new Option(`${g.gun_code}（${g.unit}）`, g.gun_code));
+  if (d.items.length && [...sel.options].some(o => o.value === was)) sel.value = was;
+  const persons = await api("/api/admin/persons");
+  const signBox = document.getElementById("sc-signers");
+  signBox.innerHTML = "";
+  for (const p of persons.items) {
+    // 仅提供可签名主体（持有 IAM 密钥）；无密钥人员签不了名，服务端也会拒绝
+    if (!p.can_sign) continue;
+    const lab = el("label", { style: "font-weight:400" },
+      el("input", { type: "checkbox", value: p.person_id, class: "sc-signer" }),
+      ` ${p.name}（${p.person_id} · ${p.duty}）`);
+    signBox.appendChild(lab);
+  }
+  renderScrapDetail();
+  sel.onchange = () => { scrapDone = []; renderScrapDetail(); };
+  const acts = document.getElementById("sc-actions");
+  acts.innerHTML = "";
+  for (const s of ["province_confirm", "destroy_submit", "destroy_inventory",
+                    "destroy_execute", "destroy_archive"]) {
+    const b = document.createElement("button");
+    b.textContent = SCRAP_LABEL[s];
+    if (s === "destroy_archive") b.className = "primary";
+    b.addEventListener("click", () => doScrap(s));
+    acts.appendChild(b);
+  }
+}
+
+function renderScrapDetail() {
+  const code = $("sc-gun").value;
+  const box = document.getElementById("sc-detail");
+  if (!code) { box.innerHTML = '<div class="empty">当前无待销毁枪支</div>'; return; }
+  const chips = SCRAP_STAGES.map(s =>
+    `<span class="badge ${scrapDone.includes(s) ? "b-approved" : "b-applied"}">${SCRAP_LABEL[s]}</span>`).join(" ");
+  box.innerHTML = `<div style="margin-bottom:8px">当前对象：${mono(code).__html}</div><div class="row-actions">${chips}</div>`;
+}
+
+async function doScrap(stage) {
+  const code = $("sc-gun").value;
+  if (!code) return err("无对象", "请先选择待销毁枪支");
+  const picked = [...document.querySelectorAll(".sc-signer:checked")].map(i => i.value);
+  if (stage.startsWith("destroy") && picked.length < 2) return err("签名人不足", "销毁节点须两名以上签名人");
+  const persons = (await api("/api/admin/persons")).items;
+  const signers = picked.map(pid => {
+    const p = persons.find(x => x.person_id === pid) || {};
+    return [pid, p.duty || "监督"];
+  });
+  try {
+    await api("/api/scrap", {
+      gun_code: code, stage, signers,
+      done_stages: stage === "destroy_archive" ? scrapDone : undefined,
+    });
+    if (!scrapDone.includes(stage)) scrapDone.push(stage);
+    ok("节点已上链", SCRAP_LABEL[stage] + " 已记录并链上确认");
+    renderScrapDetail();
+    if (stage === "destroy_archive") ok("销毁完成", "标识永久封存，历史记录保留可查");
+  } catch (e) { err("操作被拒", e.message); }
+}
+
+/* ---------------- 预警中心 ---------------- */
+async function loadAlerts() {
+  const d = await api("/api/alerts");
+  const body = document.getElementById("al-body");
+  renderTable(body, [
+    { key: "alert_id", label: "编号", fmt: (v) => ({ __html: `<span class="mono">${esc(v.slice(0, 14))}…</span>` }) },
+    { key: "level", label: "级别", fmt: (v) => alertBadge(v) },
+    { key: "status", label: "状态", fmt: (v) => alertStBadge(v) },
+    { key: "gun_code", label: "涉枪", fmt: (v) => mono(v) },
+    { key: "detail", label: "内容", fmt: (v) => v.message || "-" },
+    { key: "created_at", label: "产生时间", fmt: (v) => fmtTime(v) },
+    { key: "deadline", label: "处置时限", fmt: (v) => fmtTime(v) },
+    { key: "actions", label: "操作", fmt: (v, r) =>
+        r.status === "closed" ? "" :
+        { __html: `<button class="sm" data-resp="${esc(r.alert_id)}">响应处置</button>` } },
+  ], d.items, "暂无预警，可点击上方「扫描超期」");
+  body.querySelectorAll("[data-resp]").forEach(b => b.addEventListener("click", () => respondAlert(b.dataset.resp)));
+}
+
+async function respondAlert(id) {
+  const text = prompt("处置响应内容（留空则仅标记）：", "现场核查，通知单位负责人");
+  if (text === null) return;
+  try {
+    await api("/api/alerts/respond", { alert_id: id, response: text, close: true });
+    ok("已响应并闭环", "响应内容上链留痕");
+    loadAlerts();
+  } catch (e) { err("失败", e.message); }
+}
+
+async function doScan() {
+  try {
+    const r = await api("/api/overdue/scan", {});
+    ok("扫描完成", r.found.length + " 条超期记录，已按分级生成预警");
+    loadAlerts(); loadOverview();
+  } catch (e) { err("扫描失败", e.message); }
+}
+async function doEscalate() {
+  try {
+    const r = await api("/api/overdue/escalate", {});
+    ok("升级完成", r.upgraded.length + " 条预警已升级（提示→关注→紧急）");
+    loadAlerts();
+  } catch (e) { err("升级失败", e.message); }
+}
+
+/* ---------------- 一链查证 ---------------- */
+async function loadEvidence() {
+  const form = document.getElementById("ev-form");
+  form.innerHTML = "";
+  const f = el("div", { class: "form-row" },
+    field("整枪码", (() => { const i = inputEl("", "如 BFP20260000001"); i.id = "ev-code"; return i; })()),
+    el("div", { class: "field", style: "align-self:end" },
+      btnEl("核验", async () => {
+        const code = document.getElementById("ev-code").value.trim();
+        if (!code) return err("请输入整枪码");
+        try {
+          const d = await api("/api/gun/" + encodeURIComponent(code) + "/evidence");
+          renderChecks(d);
+          const tl = await api("/api/gun/" + encodeURIComponent(code) + "/timeline");
+          makeTimelineTable("ev-tl", tl.items);
+        } catch (e) { err("核验失败", e.message); }
+      }, "primary")));
+  form.appendChild(f);
+}
+
+function renderChecks(report) {
+  const box = document.getElementById("ev-checks");
+  const rows = [];
+  const labels = { hash_chain: "领域事件哈希链", ledger: "链上账本完整性",
+    coverage: "提交—上链对账", evidence_match: "事件哈希与交易比对",
+    rule_versions: "合约规则版本回溯" };
+  for (const [k, c] of Object.entries(report.checks)) {
+    let detail = c.detail || JSON.stringify(c);
+    if (k === "rule_versions") detail = JSON.stringify(c.history || {});
+    rows.push({ key: k, ok: c.ok, label: labels[k] || k, detail: String(detail) });
+  }
+  box.innerHTML = rows.map(r => `<div class="detail-grid" style="padding:10px 0;border-bottom:1px solid rgba(34,52,92,.5)">
+      <span class="k">${esc(r.label)}</span>
+      <span>${(r.ok ? badge("通过", "approved") : badge("失败", "emergency")).__html}
+        <span style="color:var(--muted);font-size:12px">${esc(r.detail)}</span></span>
+    </div>`).join("");
+}
+
+boot();
+</script>
+</body>
+</html>
