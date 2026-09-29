@@ -93,6 +93,7 @@ async function loadMyGuns() {
     { key: "unit_name", label: "所属单位", fmt: (v, r) => v || (typeof r.unit === "object" ? r.unit?.name : r.unit) || "-" },
     { key: "last_event", label: "最后事件" },
     { key: "last_ts", label: "最后时间", fmt: (v) => fmtTime(v) },
+    { key: "arc", label: "档案", fmt: (v, r) => archiveLink(r.gun_code) },
   ], d.items, "当前名下无持用枪支");
 }
 

@@ -47,6 +47,15 @@ async function boot() {
       <div class="card"><h3>起运（需已批准许可）</h3><div id="ts-form"></div></div></div>
       <div class="card" style="margin-top:14px"><h3>本部门许可清单</h3><div id="tp-list"></div></div>`;
 
+  const pCoop = pane("协同审批", "本单位申请：哪个部门办理 · 当前进度 · 缺什么材料 · 审批结果");
+  pCoop.innerHTML = `<div class="card"><h3>本单位申请清单</h3><div id="uc-body"></div></div>
+      <div class="card" id="uc-detail" style="display:none;margin-top:14px"><h3>审批详情</h3><div id="uc-detail-body"></div></div>
+      <div class="card" style="margin-top:14px"><h3>发起申请（材料按规则清单勾选）</h3><div id="uc-form"></div></div>
+      <div class="card" style="margin-top:14px"><h3>配售登记（交付后登记，解除运输/领用前置）</h3><div id="uc-sale"></div></div>`;
+
+  const pInsp = pane("监督检查", "检查单位 · 问题 · 整改期限 · 复查结果——本单位检查整改闭环");
+  pInsp.innerHTML = `<div class="card"><h3>本单位检查单</h3><div id="ui-body"></div></div>`;
+
   const p4 = pane("维修登记", "维修记录与更换散件上链，保养/维修与报废区分留痕");
   p4.innerHTML = `<div class="card" style="max-width:640px"><h3>维修登记</h3><div id="rp-form"></div></div>
       <div class="card" style="margin-top:14px"><div id="rp-out"></div></div>`;
@@ -71,6 +80,8 @@ async function boot() {
     { id: "guns", title: "本部门台账", pane: p1, load: loadUnitGuns },
     { id: "check", title: "领用 / 归还", pane: p2, load: loadCheckForms },
     { id: "transport", title: "运输申报", pane: p3, load: loadTransport },
+    { id: "coop", title: "协同审批", pane: pCoop, load: loadUnitCoop },
+    { id: "inspect", title: "监督检查", pane: pInsp, load: loadUnitInspections },
     { id: "repair", title: "维修登记", pane: p4, load: loadRepair },
     { id: "people", title: "人员与设备", pane: p5, load: loadPeople },
     { id: "scrap", title: "报废申报", pane: p7, load: loadScrapApply },
@@ -95,6 +106,7 @@ async function loadUnitGuns() {
     { key: "holder", label: "持用人" },
     { key: "last_event", label: "最后事件" },
     { key: "last_ts", label: "最后时间", fmt: (v) => fmtTime(v) },
+    { key: "arc", label: "档案", fmt: (v, r) => archiveLink(r.gun_code) },
   ], d.items.map(r => ({ ...r, link: () => showUnitTimeline(r.gun_code) })),
     "暂无枪支");
 }
@@ -478,10 +490,29 @@ async function loadManufacture() {
   mf.appendChild(makerLbl);
   mf.append(el("div", { class: "form-row" },
     field("枪种", kind), field("制造年份", year), field("生产流水号", serial)));
+  // 生产批次：从已批准的生产计划中选择（赋码须有计划且批次备案）
+  const batch = selectEl([]);
+  batch.id = "mf-batch";
+  batch.appendChild(new Option("加载中…", ""));
+  api("/api/bureau/plans").then(p => {
+    batch.innerHTML = "";
+    const plans = (p.items || []).filter(x => x.status === "approved");
+    if (!plans.length) {
+      batch.appendChild(new Option("暂无已批准的生产计划（请先办理计划备案）", ""));
+      return;
+    }
+    for (const x of plans) {
+      batch.appendChild(new Option(
+        `${x.batch_ref}（计划 ${x.planned_qty} 支，已赋码 ${(x.gun_codes || []).length}）`,
+        x.batch_ref));
+    }
+  }).catch(() => { batch.innerHTML = ""; });
+  mf.append(el("div", { class: "form-row" }, field("生产批次（已批准计划）", batch)));
   mf.append(btnEl("赋码入链", async () => {
     try {
       const r = await api("/api/unit/manufacture", {
         kind: kind.value, year: parseInt(year.value), serial: parseInt(serial.value),
+        batch_ref: batch.value || "",
       });
       const g = r.gun;
       const parts = (g.identity && g.identity.parts || []).join("，");
@@ -496,6 +527,309 @@ async function loadManufacture() {
       loadManufacture();
     } catch (e) { err("赋码失败", e.message); }
   }, "primary"));
+}
+
+/* ---------------- 协同审批（本单位申请） ---------------- */
+let UC_RULES = { rules: [] };
+let UC_FORM_READY = false;
+
+function unitCurText(a) {
+  if (a.status === "pending")
+    return (a.current_agency_name || "-") + " · " + (a.current_action || "");
+  if (a.status === "supplement") return "申请单位（补正材料）";
+  const last = (a.steps || [])[a.steps.length - 1];
+  return last ? last.agency_name + " · " + last.handler : "-";
+}
+
+async function loadUnitCoop() {
+  if (!UC_RULES.rules.length) {
+    try { UC_RULES = await api("/api/bureau/rules"); } catch (e) { /* ignore */ }
+  }
+  buildUnitAppForm();
+  buildUnitSaleForm().catch(() => {});
+  const d = await api("/api/bureau/apps");
+  const items = (d.items || []).filter(a => a.applicant_unit === S.me.user.org);
+  renderTable(document.getElementById("uc-body"), [
+    { key: "app_id", label: "编号", fmt: v => mono(v) },
+    { key: "matter_name", label: "事项" },
+    { key: "category", label: "类别" },
+    { key: "cur", label: "当前由谁处理" },
+    { key: "status_label", label: "审批结果", fmt: v => stageBadge(v) },
+    { key: "missing", label: "缺件", fmt: v => (v && v.length) ? v.join("、") : "-" },
+    { key: "act", label: "操作", fmt: (v, r) => {
+        const btns = [`<button class="sm" data-detail="${esc(r.app_id)}">详情</button>`];
+        if (r.status === "supplement")
+          btns.push(`<button class="sm primary" data-resub="${esc(r.app_id)}">提交补正</button>`);
+        return { __html: btns.join(" ") };
+      } },
+  ], items.map(a => ({ ...a, cur: unitCurText(a) })), "本单位暂无申请事项");
+  const body = document.getElementById("uc-body");
+  body.querySelectorAll("[data-detail]").forEach(b =>
+    b.addEventListener("click", () => selectUnitCoop(b.dataset.detail)));
+  body.querySelectorAll("[data-resub]").forEach(b =>
+    b.addEventListener("click", () => selectUnitCoop(b.dataset.resub)));
+}
+
+async function selectUnitCoop(appId) {
+  let app = null;
+  try {
+    const d = await api("/api/bureau/apps");
+    app = (d.items || []).find(a => a.app_id === appId);
+  } catch (e) { err("加载失败", e.message); return; }
+  if (!app) return;
+  const panel = document.getElementById("uc-detail");
+  panel.style.display = "block";
+  const box = document.getElementById("uc-detail-body");
+  box.innerHTML = "";
+
+  const head = el("div", { class: "rec-head" });
+  head.appendChild(el("strong", {}, app.title || app.matter_name));
+  const b1 = el("span"); b1.innerHTML = stageBadge(app.status_label).__html; head.appendChild(b1);
+  const b2 = el("span"); b2.innerHTML = sourceBadge(app.source).__html; head.appendChild(b2);
+  box.appendChild(head);
+
+  const grid = el("div", { class: "detail-grid" });
+  const rows = [
+    ["事项", app.matter_name + "（" + app.app_id + "）"],
+    ["当前由谁处理", unitCurText(app)],
+    ["关联枪支", (app.gun_codes || []).join("、") || "-"],
+    ["已交材料", (app.materials || []).join("、") || "-"],
+    ["缺什么材料", (app.missing || []).join("、") || "无"],
+    ["法规依据", app.legal || "-"],
+    ["受理时间", fmtTime(app.created_at)],
+    ["存证编号", app.evidence_no],
+    ["证照", app.license
+      ? `${app.license.name} ${app.license.license_id}（${fmtTime(app.license.valid_from)} ~ ${fmtTime(app.license.valid_to)}）`
+      : "-"],
+  ];
+  for (const [k, v] of rows) {
+    grid.appendChild(el("span", { class: "k" }, k));
+    const cell = el("span", {}, v || "-");
+    if (k === "存证编号" && v) cell.className = "mono";
+    grid.appendChild(cell);
+  }
+  box.appendChild(grid);
+
+  // 部门链：优先用后端按 step_index 计算的节点视图（补正/重新批准后不错位），
+  // 旧数据无 chain 字段时回退到规则链 + steps 按位置推断。
+  const r = UC_RULES.rules.find(x => x.matter === app.matter) || { chain: [] };
+  const nodes = (app.chain && app.chain.length) ? app.chain
+    : r.chain.map((sd, i) => {
+        const done = (app.steps || [])[i];
+        return {
+          agency_name: sd.agency_name, action: sd.action,
+          status: done ? (app.status === "rejected" ? "退回" : "已完成")
+            : (i === app.current_step && app.status === "pending" ? "办理中"
+              : app.status === "supplement" ? "退回补正" : "待办理"),
+          handler: done ? done.handler : "", at: done ? done.at : "",
+          opinion: done ? done.opinion : "",
+        };
+      });
+  const chain = el("div", { class: "chain" });
+  nodes.forEach((n) => {
+    const row = el("div", { class: "step-row" });
+    row.appendChild(el("span", { class: "step-agency" }, n.agency_name + " · " + n.action));
+    const sb = el("span");
+    sb.innerHTML = stageBadge(n.status || "待办理").__html;
+    row.appendChild(sb);
+    row.appendChild(el("span", { class: "step-op" },
+      n.handler ? `经办 ${n.handler} · ${fmtTime(n.at)}` : "待办理"));
+    if (n.opinion) row.appendChild(el("span", { class: "step-op" }, "「" + n.opinion + "」"));
+    chain.appendChild(row);
+  });
+  box.appendChild(chain);
+
+  // 退回补正：规则清单 + 部门另行指定的补正缺件 + 已交材料（去重），
+  // 非规则材料的缺件默认不勾选，须显式补交才能清空 missing。
+  if (app.status === "supplement") {
+    const matsBox = el("div", { class: "row-actions", style: "margin-top:12px" });
+    const union = [...new Set([...(r.materials || []),
+      ...(app.missing || []), ...(app.materials || [])])];
+    for (const m of union) {
+      const inp = el("input", { type: "checkbox", value: m });
+      inp.checked = (app.materials || []).includes(m);
+      matsBox.appendChild(el("label", { style: "font-weight:400;font-size:12.5px" },
+        inp, " " + m));
+    }
+    box.appendChild(field("补正材料（勾选齐全后提交）", matsBox));
+    const acts = el("div", { class: "row-actions", style: "margin-top:10px" });
+    acts.appendChild(btnEl("提交补正材料", async () => {
+      const picked = [...matsBox.querySelectorAll("input:checked")].map(i => i.value);
+      try {
+        await api(`/api/bureau/apps/${encodeURIComponent(app.app_id)}/resubmit`,
+          { materials: picked });
+        ok("补正已提交", "材料齐全将回到部门审批链");
+        loadUnitCoop();
+        selectUnitCoop(app.app_id);
+      } catch (e) { err("提交失败", e.message); }
+    }, "primary"));
+    box.appendChild(acts);
+  } else {
+    box.appendChild(el("div", { style: "margin-top:10px;font-size:12.5px;color:var(--muted)" },
+      app.status === "pending"
+        ? "当前由 " + (app.current_agency_name || "-") + " 办理，审批结果实时同步"
+        : app.status === "approved"
+          ? "审批完成，证照已核发（见上方「证照」）"
+          : "该事项已结办"));
+  }
+}
+
+function buildUnitAppForm() {
+  if (UC_FORM_READY) return;
+  UC_FORM_READY = true;
+  const c = document.getElementById("uc-form");
+  c.innerHTML = "";
+  const matterSel = selectEl(UC_RULES.rules.map(r2 => [r2.matter, r2.name + "（" + r2.category + "）"]));
+  matterSel.id = "uc-matter";
+  const titleInp = inputEl("", "如 某狩猎场 · 猎枪配置（狩猎期作业）");
+  titleInp.id = "uc-title";
+  const gunsSel = selectEl([]);
+  gunsSel.id = "uc-guns"; gunsSel.multiple = true; gunsSel.size = 5;
+  const matsBox = el("div", { class: "row-actions" });
+  const legalNote = el("p", { style: "font-size:12px;color:var(--muted);margin-top:8px" });
+  const renderMats = () => {
+    const r2 = UC_RULES.rules.find(x => x.matter === matterSel.value)
+      || { materials: [], legal: "" };
+    matsBox.innerHTML = "";
+    for (const m of r2.materials) {
+      const inp = el("input", { type: "checkbox", value: m });
+      inp.checked = true;
+      matsBox.appendChild(el("label", { style: "font-weight:400;font-size:12.5px" },
+        inp, " " + m));
+    }
+    legalNote.textContent = r2.legal || "";
+  };
+  matterSel.onchange = renderMats;
+  c.append(el("div", { class: "form-row" }, field("审批事项", matterSel), field("标题", titleInp)));
+  // 生产计划类事项：登记批次与计划数量（批准后自动生成可执行计划记录）
+  const planRow = el("div", { class: "form-row", style: "display:none" });
+  const batchInp = inputEl("", "如 B2026-003"); batchInp.id = "uc-batch";
+  const qtyInp = inputEl("", "计划支数"); qtyInp.id = "uc-qty"; qtyInp.type = "number";
+  planRow.append(field("生产批次", batchInp), field("计划数量（支）", qtyInp));
+  c.append(planRow);
+  matterSel.addEventListener("change", () => {
+    planRow.style.display = matterSel.value === "production_plan" ? "" : "none";
+  });
+  c.append(field("关联枪支（本单位，可多选）", gunsSel));
+  c.append(field("申报材料（按规则清单）", matsBox));
+  c.append(legalNote);
+  c.append(btnEl("提交申请", async () => {
+    const materials = [...matsBox.querySelectorAll("input:checked")].map(i => i.value);
+    const gun_codes = [...gunsSel.selectedOptions].map(o => o.value);
+    try {
+      await api("/api/bureau/apps",
+        { matter: matterSel.value, title: titleInp.value, materials, gun_codes,
+          batch_ref: batchInp.value || "",
+          planned_qty: parseInt(qtyInp.value || "0") || 0 });
+      ok("申请已提交", "进入部门审批链，可在清单中跟踪进度");
+      loadUnitCoop();
+    } catch (e) { err("提交失败", e.message); }
+  }, "primary"));
+  api("/api/guns").then(g => {
+    for (const x of (g.items || [])) gunsSel.appendChild(new Option(x.gun_code, x.gun_code));
+  }).catch(() => {});
+  renderMats();
+}
+
+/* ---------------- 配售登记（P2-4：补齐 UI 入口） ---------------- */
+let UC_SALE_READY = false;
+async function buildUnitSaleForm() {
+  if (UC_SALE_READY) return;
+  UC_SALE_READY = true;
+  const c = document.getElementById("uc-sale");
+  c.innerHTML = "";
+  const org = S.me.user.org;
+  const sellerSel = selectEl([]); sellerSel.id = "sale-seller";
+  const buyerSel = selectEl([]); buyerSel.id = "sale-buyer";
+  const gunsSel = selectEl([]); gunsSel.multiple = true; gunsSel.size = 5;
+  const licSel = selectEl([]); licSel.id = "sale-license";
+  const appSel = selectEl([]); appSel.id = "sale-papp";
+  const noteInp = inputEl("", "如 2026 年度配售计划 · 关联运输许可");
+  const hint = el("p", { style: "font-size:12px;color:var(--muted);margin-top:8px" },
+    "登记须同时满足：双方单位在册、枪支归属当事方、双方资质有效、关联有效证照；"
+    + "不满足时后台会说明缺哪项前置条件。");
+  c.append(el("div", { class: "form-row" }, field("配售方", sellerSel), field("配置方", buyerSel)));
+  c.append(field("配售枪支（本单位在库，可多选）", gunsSel));
+  c.append(el("div", { class: "form-row" },
+    field("关联证照（本单位持有，必选）", licSel),
+    field("关联配购审批（可选，须已批准）", appSel)));
+  c.append(field("说明", noteInp));
+  c.append(hint);
+  c.append(btnEl("提交配售登记", async () => {
+    const gun_codes = [...gunsSel.selectedOptions].map(o => o.value);
+    if (!sellerSel.value || !buyerSel.value) { err("提交失败", "须选择配售方与配置方"); return; }
+    try {
+      await api("/api/bureau/sales", {
+        seller_unit: sellerSel.value, buyer_unit: buyerSel.value, gun_codes,
+        license_id: licSel.value || "",
+        purchase_app_id: appSel.value || "",
+        note: noteInp.value, scenario: "",
+      });
+      ok("配售登记成功", "交付记录入链，可解除后续运输/领用的前置校验");
+      c.querySelectorAll("input,select").forEach(x => {
+        if (x.multiple) x.selectedIndex = -1; else if (x.tagName === "SELECT") x.selectedIndex = 0;
+        else x.value = "";
+      });
+    } catch (e) { err("登记失败", e.message); }
+  }, "primary"));
+
+  // 数据源：单位 / 本单位枪支 / 本单位证照 / 本单位已批准的配购配售审批
+  try {
+    const units = await api("/api/units");
+    for (const u of (units.items || [])) {
+      sellerSel.appendChild(new Option(u.name, u.unit_id));
+      buyerSel.appendChild(new Option(u.name, u.unit_id));
+    }
+    sellerSel.value = org;
+    buyerSel.selectedIndex = 0;
+  } catch (e) { /* ignore */ }
+  api("/api/guns").then(g => {
+    for (const x of (g.items || [])) gunsSel.appendChild(new Option(x.gun_code, x.gun_code));
+  }).catch(() => {});
+  api("/api/bureau/licenses").then(d => {
+    licSel.innerHTML = new Option("选择证照…", "").outerHTML;
+    for (const l of (d.items || [])) {
+      if (l.status !== "active") continue;
+      licSel.appendChild(new Option(
+        `${l.name} ${l.license_id}（至 ${fmtTime(l.valid_to)}）`, l.license_id));
+    }
+  }).catch(() => {});
+  api("/api/bureau/apps").then(d => {
+    appSel.innerHTML = new Option("不关联（无配购审批）", "").outerHTML;
+    for (const a of (d.items || [])) {
+      if (a.status !== "approved" || a.category !== "配购配售") continue;
+      appSel.appendChild(new Option(`${a.title || a.matter_name}（${a.app_id}）`, a.app_id));
+    }
+  }).catch(() => {});
+}
+
+/* ---------------- 监督检查（本单位） ---------------- */
+async function loadUnitInspections() {
+  const d = await api("/api/bureau/inspections");
+  renderTable(document.getElementById("ui-body"), [
+    { key: "insp_id", label: "编号", fmt: v => mono(v) },
+    { key: "agency_name", label: "检查单位" },
+    { key: "checked_at", label: "检查时间", fmt: v => fmtTime(v) },
+    { key: "findings", label: "问题", fmt: v => (v || []).join("；") },
+    { key: "deadline", label: "整改期限", fmt: v => v ? fmtTime(v) : "-" },
+    { key: "status_label", label: "状态", fmt: v => stageBadge(v) },
+    { key: "fix_note", label: "整改反馈", fmt: v => v || "-" },
+    { key: "recheck_result", label: "复查结果", fmt: v => v || "-" },
+    { key: "act", label: "操作", fmt: (v, r) => r.status === "pending_fix"
+        ? { __html: `<button class="sm primary" data-fix="${esc(r.insp_id)}">登记整改</button>` }
+        : "" },
+  ], d.items || [], "本单位暂无监督检查记录");
+  const body = document.getElementById("ui-body");
+  body.querySelectorAll("[data-fix]").forEach(b => b.addEventListener("click", async () => {
+    const note = prompt("整改措施反馈：", "已按要求完成整改并复核台账");
+    if (note === null) return;
+    try {
+      await api(`/api/bureau/inspections/${encodeURIComponent(b.dataset.fix)}/rectify`,
+        { note });
+      ok("整改已登记", "等待检查部门复查");
+      loadUnitInspections();
+    } catch (e) { err("整改失败", e.message); }
+  }));
 }
 
 boot();

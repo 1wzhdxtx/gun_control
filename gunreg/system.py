@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from .audit import AuditLog
 from .bus import ChainAdapter, EventBus, OutboxRelay
+from .bureau import BureauService
 from .chain import Ledger
 from .common import Clock, IntegrityError, ValidationError
 from .contracts import ContractRegistry
@@ -126,6 +127,8 @@ class GunSystem:
         # DOMAIN
         self.domain = DomainService(self.repo, self.outbox, self.registry,
                                     self.kms, self.ca, self.audit, self.clock, self.vault)
+        # 跨部门协同审批 + 一枪一档（持久化在业务库，重启后仍可追溯）
+        self.bureau = BureauService(self.repo, self.clock, audit=self.audit)
         # QUERY 取证
         self.evidence = EvidenceService(self.repo, self.view, self.ledger, self.registry)
 

@@ -301,6 +301,32 @@ function findGun(code) {
   return false;
 }
 
+/* ---------------- 跨部门协同 / 一枪一档 ---------------- */
+const PIPELINE_ST = {
+  "已完成": "approved", "办理中": "applied", "待办理": "in_use",
+  "退回补正": "emergency", "退回": "emergency", "不适用": "closed",
+  "已失效": "closed",
+};
+function stageBadge(st) { return badge(st, PIPELINE_ST[st] || "in_stock"); }
+/* 状态徽章 + 数量：如「已完成 25」 */
+function stageCountBadge(st, n) {
+  return { __html: stageBadge(st).__html.replace("</span>", " " + n + "</span>") };
+}
+const SOURCE_LABEL = { real: "真实业务记录", demo: "演示记录", derived: "按单位类型推导" };
+function sourceBadge(src) {
+  return badge(SOURCE_LABEL[src] || src,
+    src === "real" ? "approved" : src === "demo" ? "applied" : "closed");
+}
+function archiveHref(code) { return "/archive.html?code=" + encodeURIComponent(code); }
+function archiveLink(code) {
+  return { __html: `<a class="inline-link" href="${archiveHref(code)}">一枪一档</a>` };
+}
+/* 角色 → 个人工作台（档案页返回入口） */
+const ROLE_HOME = {
+  admin: "/admin.html", unit: "/unit.html",
+  practitioner: "/practitioner.html", auditor: "/audit.html",
+};
+
 function makeTimelineTable(containerId, rows) {
   const holder = document.createElement("div");
   renderTable(holder, [

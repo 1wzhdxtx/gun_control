@@ -17,10 +17,37 @@ const SCRAP_LABEL = { apply: "申请", appraise: "鉴定", province_confirm: "�
   destroy_submit: "送交", destroy_inventory: "清点", destroy_execute: "销毁",
   destroy_archive: "影像留存·封存" };
 
+/* 跨部门协同状态（与后端 agency_of_org 同构，供“当前由谁处理”展示） */
+let BUREAU = { rules: [], agencies: [], scenarios: [], stages: [] };
+let MY_AGENCY = null;
+function agencyOfOrg(org) {
+  if (org === "police:province") return "police-province";
+  if (org && org.indexOf("police:") === 0) return "police-city";
+  if (org === "dept:forestry") return "forestry";
+  if (org === "dept:sports") return "sports";
+  if (org === "dept:customs") return "customs";
+  return null;
+}
+const agencyName = (id) =>
+  (BUREAU.agencies.find(a => a.agency_id === id) || {}).name || id || "-";
+
 async function boot() {
   if (!await loadMe()) return;
-  const p1 = pane("总览", "全量台账摘要、预警态势与演示时间（时限合约演示用）");
+  MY_AGENCY = agencyOfOrg(S.me.user.org);
+  try { BUREAU = await api("/api/bureau/rules"); } catch (e) { /* 规则加载失败时后续按空处理 */ }
+
+  const p1 = pane("全生命周期监管总览", "五类业务场景入口 · 各阶段数量 · 待审批事项 · 检查整改情况（时限合约演示时钟在此推进）");
   p1.innerHTML = `<div class="grid c3" id="ov-kpis"></div>
+    <div class="card" style="margin-top:14px"><h3>五类业务场景入口（点击进入一枪一档筛选）</h3>
+      <div class="grid c3" id="ov-scen"></div></div>
+    <div class="grid c2" style="margin-top:14px">
+      <div class="card"><h3>各阶段数量（全生命周期主线）</h3><div id="ov-stages"></div></div>
+      <div class="card"><h3>待审批事项</h3><div id="ov-pending"></div></div>
+    </div>
+    <div class="grid c2" style="margin-top:14px">
+      <div class="card"><h3>检查整改情况</h3><div id="ov-insp"></div></div>
+      <div class="card"><h3>当前状态分布</h3><div id="ov-dist"></div></div>
+    </div>
     <div class="grid c2" style="margin-top:14px">
       <div class="card"><h3>演示时钟推进</h3>
         <div class="row-actions">
@@ -32,33 +59,69 @@ async function boot() {
       </div>
       <div class="card"><h3>合约与账本</h3><div id="ov-contracts"></div></div>
     </div>`;
-  const p2 = pane("枪支台账", "全量台账 · 一枪一码贯穿全生命周期，点击行查看链上时间线");
+
+  const p2 = pane("一枪一档", "一枪一码贯穿全生命周期：主线节点 + 场景信息，点击行查看链上时间线，「一枪一档」直达档案");
   p2.innerHTML = `<div class="grid c2" style="margin-bottom:14px">
       <div class="card">
         <div class="form-row">
           <div class="field"><label>状态筛选</label><select id="g-status"></select></div>
           <div class="field"><label>单位</label><select id="g-unit"><option value="">全部单位</option></select></div>
+          <div class="field"><label>业务场景</label><select id="g-scen"><option value="">全部场景</option></select></div>
           <div class="field"><label>枪码搜索</label><input id="g-q" placeholder="整枪码或单位"></div>
           <div class="field" style="align-self:end"><button id="g-go" class="primary">查询</button></div>
         </div>
       </div></div>
       <div class="card"><div id="gl-body"></div></div>
       <div class="card" id="tl-panel" style="display:none;margin-top:14px"><h3 id="tl-title"></h3><div id="tl-body"></div></div>`;
-  const p3 = pane("运输监管", "跨区域运输许可闭环：审批 → 起运（车辆/承运绑定）→ 到达核销");
+
+  const pCoop = pane("协同审批", "哪个部门办理 · 当前由谁处理 · 缺什么材料 · 审批结果（公安 / 林草 / 体育 / 海关按事项与辖区分权办理）");
+  pCoop.innerHTML = `<div class="card">
+      <div class="form-row">
+        <div class="field"><label>状态</label><select id="cp-status">
+          <option value="">全部状态</option><option value="pending">办理中</option>
+          <option value="supplement">退回补正</option><option value="approved">已完成</option>
+          <option value="rejected">已退回</option></select></div>
+        <div class="field"><label>业务类别</label><select id="cp-cat">
+          <option value="">全部类别</option><option>资质审批</option><option>计划备案</option>
+          <option>配购配售</option><option>进出境</option></select></div>
+        <div class="field" style="align-self:end"><button id="cp-go" class="primary">查询</button></div>
+      </div></div>
+    <div class="card" style="margin-top:14px"><h3>协同审批清单</h3><div id="cp-body"></div></div>
+    <div class="card" id="cp-detail" style="display:none;margin-top:14px"><h3>审批详情</h3><div id="cp-detail-body"></div></div>
+    <div class="card" style="margin-top:14px"><h3>发起申请（可配置规则）</h3><div id="cp-form"></div></div>`;
+
+  const p3 = pane("运输监管", "跨区域运输许可闭环：审批 → 起运（车辆/承运绑定）→ 到达核销；关联上游配售、涉枪档案与交接记录");
   p3.innerHTML = `<div class="card"><div id="pt-body"></div></div>`;
-  const p4 = pane("报废监督", "报废销毁四节点逐项上链：省级确认 → 送交 → 清点 → 销毁 → 影像封存（双人签名）");
+
+  const pInsp = pane("监督检查", "检查单位 · 问题 · 整改期限 · 复查结果——检查、整改、复查三态闭环");
+  pInsp.innerHTML = `<div class="card"><h3>发起监督检查</h3><div id="isp-form"></div></div>
+    <div class="card" style="margin-top:14px"><h3>检查台账</h3><div id="isp-body"></div></div>`;
+
+  const pBorder = pane("进出境业务", "按适用情形启用：贸易进出口与人员携带进出境分开建项（《枪支管理法》第三十五至三十七条）");
+  pBorder.innerHTML = `<div class="card"><h3>适用情形</h3>
+      <p style="font-size:12.5px;color:var(--muted);line-height:1.7">
+        <strong>贸易进出口</strong>：出口/进口申报，海关受理 → 查验放行两节点办理。<br>
+        <strong>人员携带进出境</strong>：携带枪支出境/入境，省级公安机关批准 → 海关出境（入境）申报登记两节点办理。<br>
+        依据《枪支管理法》第三十五至三十七条；未发生进出境业务的枪支档案显示「不适用」。
+      </p></div>
+    <div class="card" style="margin-top:14px"><h3>发起进出境申报</h3><div id="bd-form"></div></div>
+    <div class="card" style="margin-top:14px"><h3>进出境事项</h3><div id="bd-body"></div></div>`;
+
+  const p4 = pane("报废监督", "报废销毁四节点逐项上链：省级确认 → 送交 → 清点 → 销毁 → 影像封存（双人签名，档案终点）");
   p4.innerHTML = `<div class="grid c2">
       <div class="card"><h3>待处理报废</h3><select id="sc-gun"></select>
         <div id="sc-detail" style="margin-top:12px"></div></div>
       <div class="card"><h3>销毁签名人（须≥2人）</h3><div id="sc-signers"></div>
         <div class="row-actions" style="margin-top:12px" id="sc-actions"></div></div>
     </div>`;
+
   const p5 = pane("预警中心", "时限合约三级预警与处置闭环：扫描超期 → 升级 → 响应/闭环");
   p5.innerHTML = `<div class="row-actions" style="margin-bottom:14px">
       <button id="al-scan" class="primary">扫描超期</button>
       <button id="al-esc">升级未响应预警</button>
     </div>
     <div class="card"><div id="al-body"></div></div>`;
+
   const p6 = pane("一链查证", "责任倒查与证据核验：哈希链完整 / 链上覆盖 / 证据比对 / 规则版本回溯");
   p6.innerHTML = `<div class="grid c2">
       <div class="card"><div id="ev-form"></div><div id="ev-checks" style="margin-top:12px"></div></div>
@@ -66,26 +129,33 @@ async function boot() {
     </div>`;
 
   const tabs = [
-    { id: "overview", title: "总览", pane: p1, load: loadOverview },
-    { id: "guns", title: "枪支台账", pane: p2, load: loadGuns },
+    { id: "overview", title: "全生命周期监管总览", pane: p1, load: loadOverview },
+    { id: "guns", title: "一枪一档", pane: p2, load: loadGuns },
+    { id: "coop", title: "协同审批", pane: pCoop, load: loadCoop },
     { id: "permits", title: "运输监管", pane: p3, load: loadPermits },
+    { id: "inspect", title: "监督检查", pane: pInsp, load: loadInspections },
+    { id: "border", title: "进出境", pane: pBorder, load: loadBorder },
     { id: "scrap", title: "报废监督", pane: p4, load: loadScrap },
     { id: "alerts", title: "预警中心", pane: p5, load: loadAlerts },
     { id: "evidence", title: "一链查证", pane: p6, load: loadEvidence },
   ];
-  renderShell(tabs, "监管视角：全量台账 · 审批 · 取证");
+  renderShell(tabs, "监管视角：五类场景 · 一枪一档 · 跨部门协同");
 
   document.getElementById("adv6").onclick = () => advance(6);
   document.getElementById("adv24").onclick = () => advance(24);
   document.getElementById("adv72").onclick = () => advance(72);
   document.getElementById("g-go").onclick = loadGuns;
+  document.getElementById("cp-go").onclick = loadCoop;
   document.getElementById("al-scan").onclick = doScan;
   document.getElementById("al-esc").onclick = doEscalate;
 
-  // 初始化状态筛选器
+  // 状态/单位/场景筛选器
   const st = document.getElementById("g-status");
   st.appendChild(new Option("全部状态", ""));
   for (const k in GUN_STATUS) st.appendChild(new Option(GUN_STATUS[k], k));
+  const scen = document.getElementById("g-scen");
+  scen.appendChild(new Option("全部场景", ""));
+  for (const s of (BUREAU.scenarios || [])) scen.appendChild(new Option(s.name, s.key));
   api("/api/units").then(u => {
     const sel = document.getElementById("g-unit");
     for (const it of u.items) sel.appendChild(new Option(`${it.name}`, it.unit_id));
@@ -96,42 +166,142 @@ async function boot() {
 
 /* ---------------- 总览 ---------------- */
 async function loadOverview() {
-  const d = await api("/api/admin/overview");
+  const [d, ov, insps] = await Promise.all([
+    api("/api/admin/overview"),
+    api("/api/bureau/overview"),
+    api("/api/bureau/inspections").catch(() => ({ items: [] })),
+  ]);
   const kpis = document.getElementById("ov-kpis");
   kpis.innerHTML = "";
+  const pendingN = (ov.pending_apps || []).length;
+  const inspOpen = Object.entries(ov.inspections_by_status || {})
+    .filter(([k]) => k !== "已闭环").reduce((a, [, v]) => a + v, 0);
   const cards = [
-    { label: "在册枪支", val: d.gun_total, cls: "" },
-    { label: "预警 · 提示", val: d.alert_by_level.hint || 0, cls: "warn" },
-    { label: "预警 · 关注", val: d.alert_by_level.concern || 0, cls: "warn" },
-    { label: "预警 · 紧急", val: d.alert_by_level.emergency || 0, cls: "danger" },
-    { label: "链上区块", val: d.ledger_blocks, cls: "ok" },
-    { label: "已确认回执", val: d.receipts, cls: "ok" },
+    { label: "在册枪支", val: d.gun_total, cls: "", note: "全单位登记总量" },
+    { label: "待审批事项", val: pendingN, cls: "warn", note: "办理中 + 退回补正" },
+    { label: "检查未闭环", val: inspOpen, cls: "warn", note: "待整改 + 待复查" },
+    { label: "有效证照", val: ov.licenses_active, cls: "ok", note: "资质/配购/任务证照" },
+    { label: "预警 · 紧急", val: d.alert_by_level.emergency || 0, cls: "danger", note: "当前未闭环预警" },
+    { label: "链上区块", val: d.ledger_blocks, cls: "ok", note: "链上存证记录" },
   ];
   for (const c of cards) {
     kpis.appendChild(el("div", { class: "card metric-card" },
-      el("span", { class: "metric-icon" }, icon(c.cls === "danger" || c.cls === "warn" ? "alerts" : c.cls === "ok" ? "ledger" : "guns")),
+      el("span", { class: "metric-icon" },
+        icon(c.cls === "danger" || c.cls === "warn" ? "alerts"
+          : c.cls === "ok" ? "ledger" : "guns")),
       el("h3", {}, c.label),
       el("div", { class: "kpi " + c.cls }, String(c.val)),
-      el("div", { class: "metric-note" }, c.label.startsWith("预警") ? "当前未闭环预警" : c.cls === "ok" ? "链上存证记录" : "全单位登记总量")));
+      el("div", { class: "metric-note" }, c.note)));
   }
-  const stBox = el("div", { class: "card", style: "grid-column:1/-1" });
-  stBox.appendChild(el("h3", {}, "当前状态分布"));
-  const palette = { in_stock: "#319c88", in_use: "#6491ce", in_transit: "#deb866", repairing: "#bf9a61", pending_destroy: "#cf7782", destroyed: "#8a98a8", sealed: "#8a98a8" };
-  const bar = el("div", { class: "distribution-bar", role: "img", "aria-label": "枪支状态分布" });
-  const dist = el("div", { class: "distribution" });
+
+  // 五类业务场景入口
+  const scenBox = document.getElementById("ov-scen");
+  scenBox.innerHTML = "";
+  for (const s of (ov.scenarios || [])) {
+    const card = el("div", { class: "card", style: "cursor:pointer;margin:0",
+      role: "button", tabindex: "0",
+      "aria-label": `筛选${s.name}场景台账` }, "");
+    card.innerHTML = `<h3 style="margin-bottom:6px">${esc(s.name)}</h3>
+      <div class="kpi">${s.guns}<small>支在册</small></div>
+      <div class="metric-note">代表枪支 <span class="mono">${esc(s.representative || "-")}</span></div>
+      <div style="margin-top:8px">${s.representative ? archiveLink(s.representative).__html : ""}</div>`;
+    const goFilter = (e) => {
+      if (e.target.tagName === "A") return;   // 档案链接自行跳转
+      document.getElementById("g-scen").value = s.key;
+      switchTab("guns");
+    };
+    card.addEventListener("click", goFilter);
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); goFilter(e); }
+    });
+    scenBox.appendChild(card);
+  }
+  if (ov.unassigned_guns) {
+    const other = el("div", { class: "card", style: "margin:0" });
+    other.innerHTML = `<h3 style="margin-bottom:6px">其他枪支</h3>
+      <div class="kpi">${ov.unassigned_guns}<small>支未归属五类场景</small></div>
+      <div class="metric-note">制造/配售企业在册待分配用途</div>`;
+    scenBox.appendChild(other);
+  }
+
+  // 各阶段数量
+  const stagesBox = document.getElementById("ov-stages");
+  stagesBox.innerHTML = "";
+  for (const s of (ov.stages || [])) {
+    const total = Object.values(s.counts || {}).reduce((a, b) => a + b, 0);
+    const row = el("div", { class: "detail-grid",
+      style: "padding:7px 0;border-bottom:1px dashed var(--line)" });
+    row.appendChild(el("span", { class: "k" }, s.name));
+    const cell = el("span", {});
+    cell.innerHTML = Object.entries(s.counts || {})
+      .map(([k, v]) => stageCountBadge(k, v).__html).join(" ")
+      + ` <span style="color:var(--muted);font-size:12px">共 ${total}</span>`;
+    row.appendChild(cell);
+    stagesBox.appendChild(row);
+  }
+
+  // 待审批事项
+  renderTable(document.getElementById("ov-pending"), [
+    { key: "app_id", label: "编号", fmt: v => mono(v) },
+    { key: "matter_name", label: "事项" },
+    { key: "applicant_unit", label: "申请单位" },
+    { key: "current_agency_name", label: "当前办理部门", fmt: (v, r) =>
+        r.status === "supplement" ? "申请单位（补正材料）" : (v || "-") },
+    { key: "status_label", label: "状态", fmt: v => stageBadge(v) },
+    { key: "act", label: "操作", fmt: (v, r) =>
+        { __html: `<button class="sm" data-coop="${esc(r.app_id)}">去协同审批</button>` } },
+  ], (ov.pending_apps || []).slice(0, 10), "暂无待审批事项");
+  document.getElementById("ov-pending").querySelectorAll("[data-coop]")
+    .forEach(b => b.addEventListener("click", () => {
+      switchTab("coop");
+      setTimeout(() => selectCoop(b.dataset.coop), 350);
+    }));
+
+  // 检查整改情况
+  const inspSummary = (ov.inspections_by_status || {});
+  const inspHead = el("div", { class: "row-actions", style: "margin-bottom:10px" });
+  for (const [k, v] of Object.entries(inspSummary)) {
+    const s = el("span");
+    s.innerHTML = stageCountBadge(k, v).__html;
+    inspHead.appendChild(s.firstChild);
+  }
+  const inspBox = document.getElementById("ov-insp");
+  inspBox.innerHTML = "";
+  inspBox.appendChild(inspHead);
+  const inspHolder = el("div");
+  inspBox.appendChild(inspHolder);
+  renderTable(inspHolder, [
+    { key: "insp_id", label: "编号", fmt: v => mono(v) },
+    { key: "agency_name", label: "检查单位" },
+    { key: "target_unit", label: "被检查单位" },
+    { key: "deadline", label: "整改期限", fmt: v => v ? fmtTime(v) : "-" },
+    { key: "status_label", label: "状态", fmt: v => stageBadge(v) },
+    { key: "recheck_result", label: "复查结果", fmt: v => v || "-" },
+  ], insps.items || [], "暂无监督检查");
+
+  // 状态分布
+  const dist = document.getElementById("ov-dist");
+  dist.innerHTML = "";
+  const palette = { in_stock: "#319c88", in_use: "#6491ce", in_transit: "#deb866",
+    repairing: "#bf9a61", pending_destroy: "#cf7782", destroyed: "#8a98a8", sealed: "#8a98a8" };
+  const bar = el("div", { class: "distribution-bar", role: "img",
+    "aria-label": "枪支状态分布" });
+  const distList = el("div", { class: "distribution" });
   for (const [status, count] of Object.entries(d.by_status)) {
     const color = palette[status] || "#8a98a8";
     const label = (GUN_STATUS[status] || status) + " · " + count;
     bar.appendChild(el("span", { style: `flex:${Number(count)};background:${color}`, title: label }));
-    dist.appendChild(el("div", { class: "distribution-item" },
+    distList.appendChild(el("div", { class: "distribution-item" },
       el("span", { class: "distribution-dot", style: "background:" + color }),
       GUN_STATUS[status] || status, el("strong", {}, String(count))));
   }
-  bar.setAttribute("aria-label", Object.entries(d.by_status).map(([k,v]) => `${GUN_STATUS[k] || k} ${v}`).join("，"));
-  stBox.appendChild(bar);
-  stBox.appendChild(dist);
-  kpis.appendChild(stBox);
-  const names = { compliance: "资格与合规", spacetime: "时空约束", timelimit: "领用时限", multisig: "双人复核", transport_permit: "运输许可", scrap_confirm: "报废确认" };
+  bar.setAttribute("aria-label", Object.entries(d.by_status)
+    .map(([k, v]) => `${GUN_STATUS[k] || k} ${v}`).join("，"));
+  dist.appendChild(bar);
+  dist.appendChild(distList);
+
+  const names = { compliance: "资格与合规", spacetime: "时空约束", timelimit: "领用时限",
+    multisig: "双人复核", transport_permit: "运输许可", scrap_confirm: "报废确认" };
   document.getElementById("ov-contracts").innerHTML = d.contracts.map((c, i) =>
     `<div class="contract-row"><span class="contract-number">${String(i + 1).padStart(2, "0")}</span>
       <div><strong>${esc(names[c.name] || c.name)}</strong> <span class="chip">v${esc(c.version)}</span><p>${esc(c.rule_text)}</p></div></div>`).join("");
@@ -145,13 +315,15 @@ async function advance(hours) {
   } catch (e) { err("推进失败", e.message); }
 }
 
-/* ---------------- 枪支台账 ---------------- */
+/* ---------------- 一枪一档（台账） ---------------- */
 async function loadGuns() {
   const status = document.getElementById("g-status").value;
   const unit = document.getElementById("g-unit").value;
   const q = document.getElementById("g-q").value;
+  const scenario = document.getElementById("g-scen").value;
   const d = await api("/api/guns?status=" + encodeURIComponent(status) +
-    "&unit=" + encodeURIComponent(unit) + "&q=" + encodeURIComponent(q));
+    "&unit=" + encodeURIComponent(unit) + "&scenario=" + encodeURIComponent(scenario) +
+    "&q=" + encodeURIComponent(q));
   renderTable(document.getElementById("gl-body"), [
     { key: "gun_code", label: "整枪码", fmt: (v) => mono(v) },
     { key: "status", label: "状态", fmt: (v) => gunBadge(v) },
@@ -159,8 +331,9 @@ async function loadGuns() {
     { key: "unit", label: "所属单位", fmt: (v) => v || "-" },
     { key: "last_event", label: "最后事件" },
     { key: "last_ts", label: "最后时间", fmt: (v) => fmtTime(v) },
+    { key: "arc", label: "档案", fmt: (v, r) => archiveLink(r.gun_code) },
   ], d.items.map(r => ({ ...r, link: () => showTimeline(r.gun_code) })),
-    "暂无枪支数据");
+    scenario ? "该场景暂无枪支" : "暂无枪支数据");
 }
 
 async function showTimeline(code) {
@@ -173,25 +346,259 @@ async function showTimeline(code) {
   } catch (e) { err("加载时间线失败", e.message); }
 }
 
+/* ---------------- 协同审批 ---------------- */
+let COOP_RULES_READY = false;
+
+async function loadCoop() {
+  if (!BUREAU.rules.length) {
+    try { BUREAU = await api("/api/bureau/rules"); } catch (e) { /* ignore */ }
+  }
+  ensureCoopForm();
+  const status = document.getElementById("cp-status").value;
+  const cat = document.getElementById("cp-cat").value;
+  const d = await api("/api/bureau/apps?status=" + encodeURIComponent(status) +
+    "&category=" + encodeURIComponent(cat));
+  renderTable(document.getElementById("cp-body"), [
+    { key: "app_id", label: "编号", fmt: v => mono(v) },
+    { key: "matter_name", label: "事项" },
+    { key: "category", label: "类别" },
+    { key: "applicant_unit", label: "申请单位" },
+    { key: "cur", label: "当前由谁处理", fmt: (v) => v },
+    { key: "status_label", label: "审批结果", fmt: v => stageBadge(v) },
+    { key: "missing", label: "缺件", fmt: v => (v && v.length)
+        ? v.join("、") : "-" },
+    { key: "act", label: "操作", fmt: (v, r) => {
+        const btns = [`<button class="sm" data-detail="${esc(r.app_id)}">详情</button>`];
+        if (r.status === "pending" && MY_AGENCY && r.current_agency === MY_AGENCY) {
+          btns.push(`<button class="sm primary" data-act="approve" data-id="${esc(r.app_id)}">批准</button>`);
+          btns.push(`<button class="sm" data-act="supplement" data-id="${esc(r.app_id)}">补正</button>`);
+          btns.push(`<button class="sm" data-act="reject" data-id="${esc(r.app_id)}">退回</button>`);
+        }
+        return { __html: btns.join(" ") };
+      } },
+  ], (d.items || []).map(a => ({ ...a, cur: coopCurText(a) })), "暂无申请事项");
+  const body = document.getElementById("cp-body");
+  body.querySelectorAll("[data-detail]").forEach(b =>
+    b.addEventListener("click", () => selectCoop(b.dataset.detail)));
+  body.querySelectorAll("[data-act]").forEach(b =>
+    b.addEventListener("click", () => doProcess(b.dataset.id, b.dataset.act)));
+}
+
+function coopCurText(a) {
+  if (a.status === "pending")
+    return (a.current_agency_name || "-") + " · " + (a.current_action || "");
+  if (a.status === "supplement") return "申请单位（补正材料）";
+  const last = (a.steps || [])[a.steps.length - 1];
+  return last ? last.agency_name + " · " + last.handler : "-";
+}
+
+async function selectCoop(appId) {
+  let app = null;
+  try {
+    const d = await api("/api/bureau/apps");
+    app = (d.items || []).find(a => a.app_id === appId);
+  } catch (e) { err("加载失败", e.message); return; }
+  if (!app) return;
+  const panel = document.getElementById("cp-detail");
+  panel.style.display = "block";
+  const box = document.getElementById("cp-detail-body");
+  box.innerHTML = "";
+
+  const head = el("div", { class: "rec-head" });
+  head.appendChild(el("strong", {}, app.title || app.matter_name));
+  const b1 = el("span"); b1.innerHTML = stageBadge(app.status_label).__html; head.appendChild(b1);
+  const b2 = el("span"); b2.innerHTML = sourceBadge(app.source).__html; head.appendChild(b2);
+  box.appendChild(head);
+
+  const grid = el("div", { class: "detail-grid" });
+  const rows = [
+    ["事项", app.matter_name + "（" + app.app_id + "）"],
+    ["业务类别", app.category],
+    ["申请单位", app.applicant_unit + (app.applicant_person ? " · " + app.applicant_person : "")],
+    ["关联枪支", (app.gun_codes || []).join("、") || "-"],
+    ["已交材料", (app.materials || []).join("、") || "-"],
+    ["缺什么材料", (app.missing || []).join("、") || "无"],
+    ["法规依据", app.legal || "-"],
+    ["受理时间", fmtTime(app.created_at)],
+    ["存证编号", app.evidence_no],
+    ["证照", app.license
+      ? `${app.license.name} ${app.license.license_id}（${fmtTime(app.license.valid_from)} ~ ${fmtTime(app.license.valid_to)}）`
+      : "-"],
+  ];
+  for (const [k, v] of rows) {
+    grid.appendChild(el("span", { class: "k" }, k));
+    grid.appendChild(el("span", {}, v || "-"));
+  }
+  box.appendChild(grid);
+
+  // 部门链：优先用后端按 step_index 计算的节点视图（补正/重新批准后不错位）
+  const chain = el("div", { class: "chain" });
+  const nodes = (app.chain && app.chain.length) ? app.chain
+    : rule(app.matter).chain.map((sd, i) => {
+        const done = (app.steps || [])[i];
+        return {
+          agency_name: sd.agency_name, action: sd.action,
+          status: done ? (app.status === "rejected" ? "退回" : "已完成")
+            : (i === app.current_step && app.status === "pending" ? "办理中" : "待办理"),
+          handler: done ? done.handler : "", at: done ? done.at : "",
+          opinion: done ? done.opinion : "",
+        };
+      });
+  nodes.forEach((n) => {
+    const row = el("div", { class: "step-row" });
+    row.appendChild(el("span", { class: "step-agency" }, n.agency_name + " · " + n.action));
+    const sb = el("span");
+    sb.innerHTML = stageBadge(n.status || "待办理").__html;
+    row.appendChild(sb);
+    row.appendChild(el("span", { class: "step-op" },
+      n.handler ? `经办 ${n.handler} · ${fmtTime(n.at)}` : "待办理"));
+    if (n.opinion) row.appendChild(el("span", { class: "step-op" }, "「" + n.opinion + "」"));
+    chain.appendChild(row);
+  });
+  box.appendChild(chain);
+
+  const acts = el("div", { class: "row-actions", style: "margin-top:12px" });
+  if (app.status === "pending") {
+    if (MY_AGENCY && app.current_agency === MY_AGENCY) {
+      for (const [act, label, cls] of [["approve", "批准", "primary"],
+                                       ["supplement", "退回补正", ""],
+                                       ["reject", "退回", ""]]) {
+        acts.appendChild(btnEl(label, () => doProcess(app.app_id, act), cls));
+      }
+    } else {
+      acts.appendChild(el("span", { style: "color:var(--muted);font-size:12.5px" },
+        "当前由 " + (app.current_agency_name || "-") + " 办理，本账号无权办理该节点"));
+    }
+  }
+  box.appendChild(acts);
+}
+
+function rule(matter) {
+  return BUREAU.rules.find(r => r.matter === matter)
+    || { chain: [], materials: [], name: matter, legal: "" };
+}
+
+async function doProcess(appId, action) {
+  const isApprove = action === "approve";
+  const opinion = prompt(
+    isApprove ? "审批意见（可留空）：" :
+    action === "supplement" ? "补正要求（须指明缺件）：" : "退回理由：",
+    isApprove ? "材料齐全，符合规定，予以批准" : "");
+  if (opinion === null) return;
+  try {
+    await api(`/api/bureau/apps/${encodeURIComponent(appId)}/process`,
+      { action, opinion });
+    ok("已办理", appId + " 节点已记录办理意见");
+    loadCoop();
+    if (document.getElementById("cp-detail").style.display !== "none") selectCoop(appId);
+  } catch (e) { err("办理被拒", e.message); }
+}
+
+function ensureCoopForm() {
+  if (COOP_RULES_READY) return;
+  COOP_RULES_READY = true;
+  buildAppForm(document.getElementById("cp-form"), false, "cp");
+}
+
+/* 申请表单（admin 可代申请单位发起；材料按规则清单勾选） */
+function buildAppForm(container, isUnit, idp) {
+  container.innerHTML = "";
+  const matterSel = selectEl(BUREAU.rules.map(r => [r.matter, r.name + "（" + r.category + "）"]));
+  matterSel.id = idp + "-matter";
+  const unitSel = selectEl([]);
+  unitSel.id = idp + "-unit";
+  if (isUnit) { unitSel.style.display = "none"; }
+  const titleInp = inputEl("", "如 某狩猎场 · 猎枪配置（狩猎期作业）");
+  titleInp.id = idp + "-title";
+  const gunsSel = selectEl([]);
+  gunsSel.id = idp + "-guns";
+  gunsSel.multiple = true; gunsSel.size = 5;
+  const matsBox = el("div", { class: "row-actions", id: idp + "-mats" });
+  const legalNote = el("p", { style: "font-size:12px;color:var(--muted);margin-top:8px" });
+
+  const renderMats = () => {
+    const r = rule(matterSel.value);
+    matsBox.innerHTML = "";
+    for (const m of r.materials) {
+      const lab = el("label", { style: "font-weight:400;font-size:12.5px" },
+        el("input", { type: "checkbox", value: m, checked: "checked" }), " " + m);
+      matsBox.appendChild(lab);
+    }
+    legalNote.textContent = r.legal || "";
+  };
+  matterSel.onchange = renderMats;
+
+  container.append(el("div", { class: "form-row" },
+    field("审批事项", matterSel), field("标题", titleInp)));
+  if (!isUnit) container.append(el("div", { class: "form-row" },
+    field("申请单位", unitSel)));
+  container.append(el("div", { class: "form-row" },
+    field("关联枪支（可多选，可不选）", gunsSel)));
+  container.append(field("申报材料（按规则清单）", matsBox));
+  container.append(legalNote);
+  container.append(btnEl("提交申请", async () => {
+    const materials = [...matsBox.querySelectorAll("input:checked")].map(i => i.value);
+    const gun_codes = [...gunsSel.selectedOptions].map(o => o.value);
+    try {
+      await api("/api/bureau/apps", {
+        matter: matterSel.value,
+        applicant_unit: isUnit ? S.me.user.org : unitSel.value,
+        title: titleInp.value, materials, gun_codes,
+      });
+      ok("申请已提交", "进入部门审批链，可在清单中跟踪进度");
+      loadCoop();
+    } catch (e) { err("提交失败", e.message); }
+  }, "primary"));
+
+  // 数据填充
+  api("/api/units").then(u => {
+    for (const it of u.items) {
+      if (it.unit_type === "police") continue;
+      unitSel.appendChild(new Option(it.name, it.unit_id));
+    }
+  }).catch(() => {});
+  api("/api/guns").then(g => {
+    for (const x of (g.items || [])) gunsSel.appendChild(new Option(x.gun_code, x.gun_code));
+  }).catch(() => {});
+  renderMats();
+}
+
 /* ---------------- 运输监管 ---------------- */
 async function loadPermits() {
-  const d = await api("/api/permits");
+  const [d, salesD] = await Promise.all([
+    api("/api/permits"),
+    api("/api/bureau/sales").catch(() => ({ items: [] })),
+  ]);
+  const sales = salesD.items || [];
   const body = document.getElementById("pt-body");
   if (!d.items.length) { body.innerHTML = '<div class="empty">暂无运输许可</div>'; return; }
   renderTable(body, [
     { key: "permit_id", label: "许可编号", fmt: (v) => mono(v) },
     { key: "status", label: "状态", fmt: (v) => permitBadge(v) },
-    { key: "gun_codes", label: "涉枪", fmt: (v) => (v || []).length + " 支" },
+    { key: "gun_codes", label: "涉枪（上游档案）", fmt: (v) => {
+        const codes = v || [];
+        if (!codes.length) return "-";
+        const first = codes[0] + (codes.length > 1 ? ` 等 ${codes.length} 支` : "");
+        return { __html: `<a class="inline-link" href="${archiveHref(codes[0])}">${esc(first)}</a>` };
+      } },
+    { key: "up", label: "上游配售", fmt: (v) => v || "-" },
     { key: "vehicle", label: "承运车辆", fmt: (v) => v || "-" },
     { key: "carrier", label: "承运人" },
     { key: "route", label: "起运地 → 运往地", fmt: (v, r) => `${r.origin} → ${r.destination}` },
+    { key: "handover", label: "交接", fmt: (v, r) => r.status === "closed"
+        ? badge("到达核销完成", "approved")
+        : r.status === "in_transit" ? badge("在途 · 待核销", "applied")
+        : badge("待起运", "in_use") },
     { key: "actions", label: "操作", fmt: (v, r) => {
         const btns = [];
         if (r.status === "applied") btns.push(`<button class="sm primary" data-a="approve" data-id="${esc(r.permit_id)}">审批</button>`);
         if (r.status === "in_transit") btns.push(`<button class="sm primary" data-a="verify" data-id="${esc(r.permit_id)}">到达核销</button>`);
         return { __html: btns.join(" ") };
       } },
-  ], d.items);
+  ], d.items.map(r => {
+    const linked = sales.filter(s => (r.gun_codes || []).some(c => (s.gun_codes || []).includes(c)));
+    return { ...r, up: linked.length ? linked.map(s => s.sale_id).join("、") : "-" };
+  }));
   body.querySelectorAll("[data-a]").forEach(b => b.addEventListener("click", async () => {
     const act = b.dataset.a, pid = b.dataset.id;
     if (act === "approve") {
@@ -203,6 +610,150 @@ async function loadPermits() {
     }
     loadPermits();
   }));
+}
+
+/* ---------------- 监督检查 ---------------- */
+async function loadInspections() {
+  buildInspForm();
+  const d = await api("/api/bureau/inspections");
+  renderTable(document.getElementById("isp-body"), [
+    { key: "insp_id", label: "编号", fmt: v => mono(v) },
+    { key: "agency_name", label: "检查单位" },
+    { key: "checked_at", label: "检查时间", fmt: v => fmtTime(v) },
+    { key: "target_unit", label: "被检查单位" },
+    { key: "findings", label: "问题", fmt: v => (v || []).join("；") },
+    { key: "deadline", label: "整改期限", fmt: v => v ? fmtTime(v) : "-" },
+    { key: "status_label", label: "状态", fmt: v => stageBadge(v) },
+    { key: "recheck_result", label: "复查结果", fmt: v => v || "-" },
+    { key: "rounds", label: "整改轮次", fmt: v => v ? (v + " 轮") : "-" },
+    { key: "act", label: "操作", fmt: (v, r) => {
+        const btns = [];
+        if (r.status === "pending_fix")
+          btns.push(`<button class="sm primary" data-fix="${esc(r.insp_id)}">登记整改</button>`);
+        if (r.status === "recheck" && MY_AGENCY && r.agency_id === MY_AGENCY)
+          btns.push(`<button class="sm primary" data-recheck="${esc(r.insp_id)}">执行复查</button>`);
+        else if (r.status === "recheck")
+          btns.push(`<span style="color:var(--muted);font-size:12px">由原检查部门复查</span>`);
+        return { __html: btns.join(" ") };
+      } },
+  ], d.items || [], "暂无监督检查记录");
+  const body = document.getElementById("isp-body");
+  body.querySelectorAll("[data-fix]").forEach(b => b.addEventListener("click", async () => {
+    const note = prompt("整改措施反馈：", "已按要求完成整改并复核台账");
+    if (note === null) return;
+    try {
+      await api(`/api/bureau/inspections/${encodeURIComponent(b.dataset.fix)}/rectify`, { note });
+      ok("整改已登记", "等待原检查部门复查");
+      loadInspections();
+    } catch (e) { err("整改失败", e.message); }
+  }));
+  body.querySelectorAll("[data-recheck]").forEach(b => b.addEventListener("click", async () => {
+    // P2-6：复查须显式给出通过/不通过（不通过退回整改，多轮记录留痕）
+    const verdict = prompt("复查结论（请输入「通过」或「不通过」）：", "通过");
+    if (verdict === null) return;
+    const v = verdict.trim();
+    if (v !== "通过" && v !== "不通过") {
+      err("输入无效", "请输入「通过」或「不通过」两个词之一");
+      return;
+    }
+    const result = prompt("复查说明：",
+      v === "通过" ? "复查合格，隐患已闭环" : "复查不合格，继续整改");
+    if (result === null) return;
+    try {
+      await api(`/api/bureau/inspections/${encodeURIComponent(b.dataset.recheck)}/recheck`,
+        { result, passed: v === "通过" });
+      ok("复查完成", v === "通过" ? "检查单已闭环" : "已退回被检查单位继续整改");
+      loadInspections();
+    } catch (e) { err("复查失败", e.message); }
+  }));
+}
+
+let INSP_FORM_READY = false;
+function buildInspForm() {
+  if (INSP_FORM_READY) return;
+  INSP_FORM_READY = true;
+  const c = document.getElementById("isp-form");
+  c.innerHTML = "";
+  const unitSel = selectEl([]); unitSel.id = "is-unit";
+  const findings = document.createElement("textarea");
+  findings.id = "is-findings"; findings.rows = 3;
+  findings.placeholder = "每行一条问题，如：二号库室视频监控存在盲区";
+  const deadline = inputEl("", "", "date"); deadline.id = "is-deadline";
+  const gunsSel = selectEl([]); gunsSel.id = "is-guns";
+  gunsSel.multiple = true; gunsSel.size = 4;
+  c.append(el("div", { class: "form-row" },
+    field("被检查单位", unitSel), field("整改期限", deadline)));
+  c.append(field("检查发现的问题", findings));
+  c.append(field("涉及枪支（可多选）", gunsSel));
+  c.append(btnEl("发起检查", async () => {
+    const items = findings.value.split(/\n+/).map(s => s.trim()).filter(Boolean);
+    if (!items.length) return err("问题必填", "至少填写一条检查发现");
+    try {
+      await api("/api/bureau/inspections", {
+        target_unit: unitSel.value, findings: items,
+        deadline: deadline.value ? new Date(deadline.value).toISOString() : "",
+        gun_codes: [...gunsSel.selectedOptions].map(o => o.value),
+      });
+      ok("检查单已下达", "被检查单位须在期限内整改");
+      loadInspections();
+    } catch (e) { err("发起失败", e.message); }
+  }, "primary"));
+  api("/api/units").then(u => {
+    for (const it of u.items) {
+      if (it.unit_type === "police") continue;
+      unitSel.appendChild(new Option(it.name, it.unit_id));
+    }
+  }).catch(() => {});
+  api("/api/guns").then(g => {
+    for (const x of (g.items || [])) gunsSel.appendChild(new Option(x.gun_code, x.gun_code));
+  }).catch(() => {});
+}
+
+/* ---------------- 进出境 ---------------- */
+async function loadBorder() {
+  buildBorderForm();
+  const d = await api("/api/bureau/apps?category=" + encodeURIComponent("进出境"));
+  renderTable(document.getElementById("bd-body"), [
+    { key: "app_id", label: "编号", fmt: v => mono(v) },
+    { key: "matter_name", label: "适用情形" },
+    { key: "applicant_unit", label: "申报单位" },
+    { key: "gun_codes", label: "涉枪", fmt: v => (v || []).length
+        ? (v || []).map(c => `<a class="inline-link" href="${archiveHref(c)}">${esc(c)}</a>`).join(" ")
+        : "-" },
+    { key: "cur", label: "当前办理部门", fmt: v => v },
+    { key: "status_label", label: "审批结果", fmt: v => stageBadge(v) },
+    { key: "act", label: "操作", fmt: (v, r) => {
+        const btns = [`<button class="sm" data-detail="${esc(r.app_id)}">详情</button>`];
+        if (r.status === "pending" && MY_AGENCY && r.current_agency === MY_AGENCY) {
+          btns.push(`<button class="sm primary" data-act="approve" data-id="${esc(r.app_id)}">批准</button>`);
+          btns.push(`<button class="sm" data-act="reject" data-id="${esc(r.app_id)}">退回</button>`);
+        }
+        return { __html: btns.join(" ") };
+      } },
+  ], (d.items || []).map(a => ({ ...a, cur: coopCurText(a) })),
+     "暂无进出境业务（按适用情形启用）");
+  const body = document.getElementById("bd-body");
+  body.querySelectorAll("[data-detail]").forEach(b =>
+    b.addEventListener("click", () => {
+      switchTab("coop");
+      setTimeout(() => selectCoop(b.dataset.detail), 350);
+    }));
+  body.querySelectorAll("[data-act]").forEach(b =>
+    b.addEventListener("click", () => doProcess(b.dataset.id, b.dataset.act)));
+}
+
+let BORDER_FORM_READY = false;
+function buildBorderForm() {
+  if (BORDER_FORM_READY) return;
+  BORDER_FORM_READY = true;
+  buildAppForm(document.getElementById("bd-form"), false, "bd");
+  // 仅保留进出境事项
+  const sel = document.getElementById("bd-matter");
+  if (sel) {
+    const borderMatters = BUREAU.rules.filter(r => r.category === "进出境").map(r => r.matter);
+    [...sel.options].forEach(o => { if (!borderMatters.includes(o.value)) o.remove(); });
+    sel.dispatchEvent(new Event("change"));
+  }
 }
 
 /* ---------------- 报废监督 ---------------- */
@@ -245,7 +796,9 @@ function renderScrapDetail() {
   if (!code) { box.innerHTML = '<div class="empty">当前无待销毁枪支</div>'; return; }
   const chips = SCRAP_STAGES.map(s =>
     `<span class="badge ${scrapDone.includes(s) ? "b-approved" : "b-applied"}">${SCRAP_LABEL[s]}</span>`).join(" ");
-  box.innerHTML = `<div style="margin-bottom:8px">当前对象：${mono(code).__html}</div><div class="row-actions">${chips}</div>`;
+  box.innerHTML = `<div style="margin-bottom:8px">当前对象：${mono(code).__html}
+      · <a class="inline-link" href="${archiveHref(code)}">一枪一档（档案封存）</a></div>
+    <div class="row-actions">${chips}</div>`;
 }
 
 async function doScrap(stage) {
@@ -266,7 +819,8 @@ async function doScrap(stage) {
     if (!scrapDone.includes(stage)) scrapDone.push(stage);
     ok("节点已上链", SCRAP_LABEL[stage] + " 已记录并链上确认");
     renderScrapDetail();
-    if (stage === "destroy_archive") ok("销毁完成", "标识永久封存，历史记录保留可查");
+    if (stage === "destroy_archive")
+      ok("销毁完成", "标识永久封存，档案终点已达成 → 点击「一枪一档」查看档案");
   } catch (e) { err("操作被拒", e.message); }
 }
 

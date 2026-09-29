@@ -23,6 +23,14 @@ from gunreg.common import (
     ValidationError,
     parse_iso,
 )
+from gunreg.bureau import (
+    AGENCIES,
+    APPROVAL_RULES,
+    PIPELINE_KEYS,
+    PIPELINE_NAMES,
+    SCENARIOS,
+    agency_of_org,
+)
 from gunreg.iam import totp
 from gunreg.identity import CALIBER_KIND, GunCode, MAKERS
 
@@ -156,7 +164,7 @@ async def units():
 # ---------------------------------------------------------------------------
 @app.get("/api/guns")
 async def guns(request: Request, status: str = "", unit: str = "",
-               q: str = "", limit: int = 300, offset: int = 0):
+               q: str = "", scenario: str = "", limit: int = 300, offset: int = 0):
     sub, _ = _require(request, "ledger:query")
     if sub.role in ("admin", "auditor"):
         _require(request, "gun:read:all")
@@ -169,6 +177,15 @@ async def guns(request: Request, status: str = "", unit: str = "",
                             status_code=403)
     page = SYSTEM.view.ledger(unit=dom or "", status=status,
                               offset=offset, limit=limit)
+    if scenario:
+        keep = set()
+        for r in SYSTEM.repo.db.query(
+                "SELECT g.code, u.unit_type FROM guns g "
+                "JOIN units u ON g.unit_id=u.unit_id"):
+            s = SYSTEM.bureau.scenario_of_gun(r["code"], r["unit_type"])
+            if s and s["key"] == scenario:
+                keep.add(r["code"])
+        page["items"] = [g for g in page["items"] if g["gun_code"] in keep]
     if q:
         q = q.strip()
         page["items"] = [g for g in page["items"]
@@ -192,6 +209,18 @@ async def gun_evidence(request: Request, code: str):
     _require(request, "evidence:verify")
     rep = SYSTEM.evidence.verify_gun(code)
     return {"gun_code": code, "ok": rep.ok, "checks": rep.checks}
+
+
+@app.get("/api/gun/{code}/archive")
+async def gun_archive(request: Request, code: str):
+    """一枪一档：全生命周期档案（主线节点 + 证照/审批/检查/运输/时间线）。"""
+    sub, _ = _require(request, "ledger:query")
+    rows = SYSTEM.repo.db.query("SELECT unit_id FROM guns WHERE code=?", (code,))
+    if not rows:
+        raise NotFoundError(f"枪支不存在: {code}")
+    if sub.role in ("unit", "practitioner"):
+        _require(request, "gun:read:domain", domain=rows[0]["unit_id"])
+    return {"ok": True, **SYSTEM.bureau.archive(code)}
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +358,8 @@ async def permits(request: Request):
 
 @app.post("/api/permit/approve")
 async def permit_approve(request: Request, payload: dict = Body(...)):
-    sub, _ = _require(request, "permit:approve")
+    # 评审问题 P1-1：运输许可审批为公安专属环节，非公安部门不可批准
+    sub, _ = _require_police(request, "permit:approve", "运输许可审批")
     p = SYSTEM.domain.approve_transport_permit(permit_id=payload["permit_id"],
                                                approver=sub.user_id)
     SYSTEM.pump(rounds=200)
@@ -338,7 +368,8 @@ async def permit_approve(request: Request, payload: dict = Body(...)):
 
 @app.post("/api/permit/verify")
 async def permit_verify(request: Request, payload: dict = Body(...)):
-    sub, _ = _require(request, "permit:approve")
+    # 评审问题 P1-1：到达核销同属公安监管环节
+    sub, _ = _require_police(request, "permit:approve", "运输到达核销")
     pos = payload.get("position")
     p = SYSTEM.domain.verify_transport_arrival(
         permit_id=payload["permit_id"],
@@ -363,6 +394,8 @@ async def permit_request(request: Request, payload: dict = Body(...)):
     if len(units) != 1:
         raise PermissionDenied(f"一次运输须为同一单位枪支（涉及 {sorted(units)}）")
     _require(request, "permit:request", domain=next(iter(units)))
+    # 前置条件：配售配购到位（有配售登记）才允许申报运输
+    SYSTEM.bureau.require_sale(guns, "运输申报")
     d = SYSTEM.domain.request_transport_permit(
         permit_id=payload.get("permit_id") or f"PERMIT-{int(CLOCK.now().timestamp())}",
         gun_codes=guns, vehicle=payload["vehicle"], carrier=payload["carrier"],
@@ -420,8 +453,9 @@ async def scrap(request: Request, payload: dict = Body(...)):
         # 单位分支：单位用户（event:submit）对本单位枪支申报/鉴定
         sub, _ = _require(request, "event:submit", domain=row["unit_id"])
     else:
-        # 监管分支：省级确认仅 admin，销毁四节点需 scrap:confirm
-        sub, _ = _require(request, "scrap:confirm")
+        # 监管分支：省级确认仅 admin，销毁四节点需 scrap:confirm；
+        # 评审问题 P1-1：报废确认与销毁监督为公安专属环节，非公安部门不可执行
+        sub, _ = _require_police(request, "scrap:confirm", "报废确认与销毁监督")
         if stage == "province_confirm" and sub.role != "admin":
             raise PermissionDenied("省级确认须由监管工作台执行")
     # 服务端代签：签名须覆盖 scrap:{stage}:{gun_code}，不能由客户端任意自签；
@@ -555,6 +589,8 @@ async def unit_checkout(request: Request, payload: dict = Body(...)):
     _require(request, "event:submit", domain=row["unit_id"])
     holder = payload["person_id"]
     pairs = [tuple(x) for x in payload["signers"]]  # [(pid, role), ...]
+    # 前置条件：配售配购到位（有配售登记）才允许领用
+    SYSTEM.bureau.require_sale([code], "领用")
     sigs = _signers_with_duty(pairs, f"checkout:{code}:{holder}",
                               org=sub.org, operator=sub.user_id, strict_duty=True)
     ev = SYSTEM.domain.checkout(
@@ -638,6 +674,10 @@ async def unit_manufacture(request: Request, payload: dict = Body(...)):
     unit = SYSTEM.repo.get_unit(sub.org)
     if unit.unit_type != "manufacture":
         raise PermissionDenied("仅制造企业可赋码")
+    # 前置条件一：有效制造许可证（《枪支管理法》第十五条，国务院公安部门核发）
+    SYSTEM.bureau.require_license(sub.org, "mfg_license", "制造赋码")
+    # 前置条件二：已批准的生产计划 + 批次备案 + 数量未用完（评审问题 P2-4）
+    plan = SYSTEM.bureau.require_plan(sub.org, payload.get("batch_ref", ""))
     maker = MAKER_BY_UNIT[sub.org]
     gun = SYSTEM.domain.manufacture(
         maker=maker, kind=payload["kind"], year=int(payload.get("year", CLOCK.now().year)),
@@ -646,8 +686,11 @@ async def unit_manufacture(request: Request, payload: dict = Body(...)):
         unit_id=sub.org,
         part_categories=payload.get("part_categories", ["枪管", "撞针", "弹匣", "枪身"]),
         signer=sub.user_id)
+    # 赋码成功后才消耗计划数量（失败不扣）
+    SYSTEM.bureau.consume_plan(plan["plan_id"], gun.code)
     SYSTEM.pump(rounds=200)
-    return {"ok": True, "gun": gun.to_dict()}
+    return {"ok": True, "gun": gun.to_dict(), "plan_id": plan["plan_id"],
+            "batch_ref": plan["batch_ref"]}
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +749,219 @@ async def qualify(request: Request, payload: dict = Body(...)):
         cert_expire=payload.get("cert_expire", ""), actor=sub.user_id)
     SYSTEM.pump(rounds=200)
     return {"ok": True, "person": p.to_dict()}
+
+
+# ---------------------------------------------------------------------------
+# 跨部门协同：五类业务场景 + 一枪一档 + 全生命周期监管
+# ---------------------------------------------------------------------------
+def _bureau_agency(request: Request, perm: str, domain: str | None = None):
+    """认证并返回 (subject, agency_id)；非部门账号 agency_id 为 None。"""
+    sub, _ = _require(request, perm, domain)
+    return sub, agency_of_org(sub.org)
+
+
+def _require_police(request: Request, perm: str, purpose: str):
+    """公安专属环节（运输审批、报废确认与销毁等）：仅公安部门账号可办理。
+
+    评审问题 P1-1：林草/体育/海关账号同为 role=admin，此前仅校验角色即可
+    批准运输、报废节点——须同步加部门（分组）校验。
+    """
+    sub, agency = _bureau_agency(request, perm)
+    if not agency or AGENCIES[agency]["group"] != "police":
+        raise PermissionDenied(
+            f"{purpose}由公安机关实施，"
+            f"当前账号所属部门无此权限（{sub.org}）")
+    return sub, agency
+
+
+def _bureau_visible(sub, items: list[dict]) -> list[dict]:
+    """部门权限过滤：单位看本单位申请；部门按事项分组（辖区）查看；审计全量。"""
+    if sub.role in ("unit", "practitioner"):
+        return [a for a in items if a["applicant_unit"] == sub.org]
+    if sub.role == "auditor":
+        return items
+    agency = agency_of_org(sub.org)
+    if not agency:
+        return items                      # 通用监管管理员：全量可见
+    matters = SYSTEM.bureau.matters_of_group(AGENCIES[agency]["group"])
+    return [a for a in items if a["matter"] in matters]
+
+
+@app.get("/api/bureau/rules")
+async def bureau_rules(request: Request):
+    """审批规则（可配置）：事项 → 部门链 + 材料 + 依据 + 五类场景 + 主线阶段。"""
+    _require(request, "ledger:query")
+    return {
+        "rules": SYSTEM.bureau.rules(),
+        "agencies": SYSTEM.bureau.agencies(),
+        "scenarios": [{"key": k, **v} for k, v in SCENARIOS.items()],
+        "stages": [{"key": k, "name": PIPELINE_NAMES[k]} for k in PIPELINE_KEYS],
+    }
+
+
+@app.get("/api/bureau/overview")
+async def bureau_overview(request: Request):
+    """全生命周期监管总览：五类场景入口、各阶段数量、待审批、检查整改。"""
+    _require(request, "gun:read:all", domain="")
+    return {"ok": True, **SYSTEM.bureau.lifecycle_overview()}
+
+
+@app.get("/api/bureau/apps")
+async def bureau_apps(request: Request, status: str = "", category: str = "",
+                      matter: str = ""):
+    sub, _ = _require(request, "ledger:query")
+    items = SYSTEM.bureau.list_apps(status=status, category=category,
+                                    matters={matter} if matter else None)
+    return {"items": _bureau_visible(sub, items)}
+
+
+@app.post("/api/bureau/apps")
+async def bureau_apply(request: Request, payload: dict = Body(...)):
+    sub, _ = _bureau_agency(request, "permit:request")
+    matter = payload.get("matter", "")
+    rule = APPROVAL_RULES.get(matter)
+    if not rule:
+        raise ValidationError(f"未知审批事项: {matter}")
+    applicant = sub.org if sub.role in ("unit", "practitioner") \
+        else payload.get("applicant_unit", "")
+    if sub.role in ("unit", "practitioner") and \
+            payload.get("applicant_unit") not in (None, "", sub.org):
+        raise PermissionDenied("仅可为本单位提交申请")
+    guns = payload.get("gun_codes") or []
+    for code in guns:
+        row = SYSTEM.repo.db.one("SELECT unit_id FROM guns WHERE code=?", (code,))
+        if not row:
+            raise NotFoundError(f"枪支不存在: {code}")
+        if sub.role in ("unit", "practitioner") and row["unit_id"] != sub.org:
+            raise PermissionDenied(f"枪支 {code} 不属于本单位")
+    # 前置条件：进出境业务须先完成配售配购登记
+    if rule["category"] == "进出境" and guns:
+        SYSTEM.bureau.require_sale(guns, rule["name"])
+    app = SYSTEM.bureau.apply(
+        matter=matter, applicant_unit=applicant,
+        applicant_person=payload.get("applicant_person", ""),
+        gun_codes=guns, materials=payload.get("materials") or [],
+        scenario=payload.get("scenario", ""), title=payload.get("title", ""),
+        source="real", actor=sub.user_id,
+        batch_ref=payload.get("batch_ref", ""),
+        planned_qty=int(payload.get("planned_qty") or 0))
+    return {"ok": True, "app": app}
+
+
+@app.post("/api/bureau/apps/{app_id}/resubmit")
+async def bureau_resubmit(request: Request, app_id: str, payload: dict = Body(...)):
+    sub, _ = _require(request, "permit:request")
+    cur = SYSTEM.bureau.get_app(app_id)
+    if sub.role in ("unit", "practitioner") and cur["applicant_unit"] != sub.org:
+        raise PermissionDenied("仅申请单位可提交补正材料")
+    app = SYSTEM.bureau.resubmit(app_id, payload.get("materials"),
+                                 actor=sub.user_id)
+    return {"ok": True, "app": app}
+
+
+@app.post("/api/bureau/apps/{app_id}/process")
+async def bureau_process(request: Request, app_id: str, payload: dict = Body(...)):
+    """按部门链办理当前节点；节点必须由链上对应部门处理（不可通用管理员包办）。"""
+    sub, agency = _bureau_agency(request, "permit:approve")
+    if not agency:
+        raise PermissionDenied("该账号不属于任何审批部门，无办理权限")
+    app = SYSTEM.bureau.process(
+        app_id, agency_id=agency, handler=sub.user_id,
+        action=payload.get("action", "approve"),
+        opinion=payload.get("opinion", ""),
+        materials=payload.get("materials"))
+    return {"ok": True, "app": app}
+
+
+@app.get("/api/bureau/licenses")
+async def bureau_licenses(request: Request, unit_id: str = ""):
+    sub, _ = _require(request, "ledger:query")
+    holder = sub.org if sub.role in ("unit", "practitioner") else unit_id
+    return {"items": SYSTEM.bureau.licenses(holder)}
+
+
+@app.get("/api/bureau/plans")
+async def bureau_plans(request: Request, unit_id: str = ""):
+    """生产计划（含批次与已赋码数量）：制造赋码选批次、档案展示用。"""
+    sub, _ = _require(request, "ledger:query")
+    unit = sub.org if sub.role in ("unit", "practitioner") else unit_id
+    return {"items": SYSTEM.bureau.plans(unit)}
+
+
+@app.get("/api/bureau/sales")
+async def bureau_sales(request: Request):
+    sub, _ = _require(request, "ledger:query")
+    items = SYSTEM.bureau.sales()
+    if sub.role in ("unit", "practitioner"):
+        items = [s for s in items
+                 if sub.org in (s["seller_unit"], s["buyer_unit"])]
+    return {"items": items}
+
+
+@app.post("/api/bureau/sales")
+async def bureau_sale_create(request: Request, payload: dict = Body(...)):
+    sub, _ = _require(request, "permit:request")
+    guns = payload.get("gun_codes") or []
+    seller = payload.get("seller_unit", "")
+    buyer = payload.get("buyer_unit", "")
+    if sub.role == "unit" and sub.org not in (seller, buyer):
+        raise PermissionDenied("本单位须作为配售方或配置方")
+    sale = SYSTEM.bureau.create_sale(
+        sale_id=payload.get("sale_id") or
+        f"SALE-{int(CLOCK.now().timestamp())}",
+        seller_unit=seller, buyer_unit=buyer, gun_codes=guns,
+        scenario=payload.get("scenario", ""),
+        license_id=payload.get("license_id", ""),
+        purchase_app_id=payload.get("purchase_app_id", ""),
+        note=payload.get("note", ""), source="real")
+    return {"ok": True, "sale": sale}
+
+
+@app.get("/api/bureau/inspections")
+async def bureau_inspections(request: Request):
+    sub, _ = _require(request, "ledger:query")
+    items = SYSTEM.bureau.inspections()
+    if sub.role in ("unit", "practitioner"):
+        items = [i for i in items if i["target_unit"] == sub.org]
+    return {"items": items}
+
+
+@app.post("/api/bureau/inspections")
+async def bureau_inspection_create(request: Request, payload: dict = Body(...)):
+    sub, agency = _bureau_agency(request, "permit:approve")
+    if not agency:
+        raise PermissionDenied("仅检查部门可发起监督检查")
+    insp = SYSTEM.bureau.create_inspection(
+        agency_id=agency, inspector=sub.user_id,
+        target_unit=payload["target_unit"],
+        findings=payload.get("findings") or [],
+        deadline=payload.get("deadline", ""),
+        gun_codes=payload.get("gun_codes") or [], source="real")
+    return {"ok": True, "inspection": insp}
+
+
+@app.post("/api/bureau/inspections/{insp_id}/rectify")
+async def bureau_rectify(request: Request, insp_id: str, payload: dict = Body(...)):
+    sub, _ = _require(request, "alert:handle")
+    insp = SYSTEM.bureau.rectify(
+        insp_id, note=payload.get("note", ""),
+        actor_unit=(sub.org if sub.role in ("unit", "practitioner") else ""),
+        actor=sub.user_id)
+    return {"ok": True, "inspection": insp}
+
+
+@app.post("/api/bureau/inspections/{insp_id}/recheck")
+async def bureau_recheck(request: Request, insp_id: str, payload: dict = Body(...)):
+    sub, agency = _bureau_agency(request, "permit:approve")
+    if not agency:
+        raise PermissionDenied("仅检查部门可执行复查")
+    # 评审问题 P2-6：复查须显式给出通过/不通过（不通过退回整改，留多轮记录）；
+    # 字段校验放在领域层部门校验之后，越权仍先返回 403。
+    insp = SYSTEM.bureau.recheck(insp_id, agency_id=agency,
+                                 inspector=sub.user_id,
+                                 result=payload.get("result", ""),
+                                 passed=payload.get("passed"))
+    return {"ok": True, "inspection": insp}
 
 
 # ---------------------------------------------------------------------------

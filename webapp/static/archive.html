@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>一枪一档 · 民用枪支区块链智慧监管</title>
+<link rel="stylesheet" href="/common.css">
+<link rel="stylesheet" href="/theme.css">
+<style>
+  .arc-wrap { max-width: 1180px; margin: 0 auto; padding: 22px 18px 60px; }
+  .arc-top { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .arc-top h1 { font-size: 20px; }
+  .arc-top .eyebrow { font-size: 10px; letter-spacing: 1.8px; color: var(--accent); font-weight: 600; }
+  .arc-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px; font-size: 12.5px; color: var(--muted); }
+  .arc-switch { display: flex; gap: 8px; align-items: center; }
+  .arc-switch select { min-height: 34px; font-size: 12px; }
+  .arc-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  .arc-card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; }
+  .arc-card h3 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; margin-bottom: 10px; }
+  details.node { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 10px; background: var(--panel); }
+  details.node summary {
+    list-style: none; cursor: pointer; padding: 12px 14px; display: flex;
+    flex-wrap: wrap; gap: 10px; align-items: center; font-size: 13px;
+  }
+  details.node summary::-webkit-details-marker { display: none; }
+  details.node summary::after { content: "▾"; margin-left: auto; color: var(--muted); }
+  details.node[open] summary { border-bottom: 1px solid var(--line); }
+  .node-idx { font-family: Consolas, monospace; color: var(--muted); font-size: 12px; }
+  .node-name { font-weight: 650; }
+  .node-scope { font-size: 11px; color: var(--muted); }
+  .node-note { font-size: 12px; color: var(--muted); width: 100%; }
+  .node-body { padding: 12px 14px; display: grid; gap: 10px; }
+  .rec { border: 1px dashed var(--line); border-radius: 8px; padding: 10px 12px; }
+  .rec-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .rec-head strong { font-size: 13px; }
+  .rec .detail-grid { grid-template-columns: 96px 1fr; }
+  .chain { margin-top: 8px; padding: 8px 10px; background: var(--bg2); border-radius: 8px; }
+  .chain .step-row { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; padding: 4px 0; border-bottom: 1px dashed var(--line); }
+  .chain .step-row:last-child { border-bottom: none; }
+  .chain .step-agency { font-weight: 600; min-width: 150px; }
+  .chain .step-op { color: var(--muted); }
+  @media (max-width: 640px) {
+    .rec .detail-grid { grid-template-columns: 84px 1fr; }
+    .chain .step-agency { min-width: 0; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="/common.js"></script>
+<script>
+const ROLE_HOME_JS = {
+  admin: "/admin.html", unit: "/unit.html",
+  practitioner: "/practitioner.html", auditor: "/audit.html",
+};
+let ALL_GUNS = [];
+
+async function boot() {
+  if (!await loadMe()) return;
+  const wrap = el("div", { class: "arc-wrap" });
+  wrap.innerHTML = `
+    <div class="arc-top">
+      <div>
+        <div class="eyebrow">一枪一档 / FULL-LIFECYCLE ARCHIVE</div>
+        <h1 id="arc-title">全生命周期档案</h1>
+        <div class="arc-meta" id="arc-meta"></div>
+      </div>
+      <div class="arc-switch">
+        <a class="inline-link" id="arc-back" href="#">← 返回工作台</a>
+        <select id="arc-select" aria-label="切换枪支"><option value="">选择枪支…</option></select>
+      </div>
+    </div>
+    <div class="arc-grid">
+      <div class="arc-card" id="arc-scenario"></div>
+      <div class="arc-card">
+        <h3>主线节点（企业资质与计划 → 制造赋码 → 配购与配售 → 运输交接 → 持有使用 → 报废销毁 · 进出境条件分支）</h3>
+        <div id="arc-pipeline"></div>
+      </div>
+      <div class="arc-card"><h3>证照与资质</h3><div id="arc-licenses"></div></div>
+      <div class="arc-card"><h3>监督检查（贯穿全程）</h3><div id="arc-insp"></div></div>
+      <div class="arc-card"><h3>链上事件时间线</h3><div id="arc-timeline"></div></div>
+    </div>`;
+  document.getElementById("root").appendChild(wrap);
+  document.getElementById("arc-back").href =
+    ROLE_HOME_JS[S.me.user.role] || "/admin.html";
+  await loadGunList();
+  document.getElementById("arc-select").onchange = (e) => {
+    if (e.target.value) location.href = archiveHrefLocal(e.target.value);
+  };
+  const q = new URLSearchParams(location.search).get("code");
+  if (q) {
+    document.getElementById("arc-select").value = q;
+    await loadArchive(q);
+  } else {
+    document.getElementById("arc-pipeline").innerHTML =
+      '<div class="empty">请选择一支枪支查看一枪一档</div>';
+  }
+}
+
+function archiveHrefLocal(code) { return "/archive.html?code=" + encodeURIComponent(code); }
+
+async function loadGunList() {
+  const sel = document.getElementById("arc-select");
+  try {
+    const me = S.me.user;
+    const d = me.role === "practitioner"
+      ? await api("/api/my/guns") : await api("/api/guns");
+    ALL_GUNS = d.items || [];
+    for (const g of ALL_GUNS) sel.appendChild(new Option(g.gun_code, g.gun_code));
+  } catch (e) { /* 列表失败不影响直接访问 ?code= */ }
+}
+
+async function loadArchive(code) {
+  let d;
+  try { d = await api("/api/gun/" + encodeURIComponent(code) + "/archive"); }
+  catch (e) { err("档案加载失败", e.message); return; }
+  document.getElementById("arc-title").textContent = "一枪一档 · " + d.gun.code;
+  document.title = "一枪一档 " + d.gun.code + " · 民用枪支区块链智慧监管";
+
+  // 头部元信息
+  const meta = document.getElementById("arc-meta");
+  const g = d.gun;
+  const id = g.identity || {};
+  meta.innerHTML = "";
+  const add = (html) => { const s = el("span"); s.innerHTML = html; meta.appendChild(s); };
+  add(gunBadge(g.status).__html);
+  add(`<span class="chip">${esc(g.unit_name || g.unit_id)}</span>`);
+  add(`<span class="chip">${esc((UNIT_TYPE[g.unit_type] || g.unit_type))}</span>`);
+  if (g.holder) add(`<span class="chip">持用人 ${esc(g.holder)}</span>`);
+  add(`<span class="chip">制造企业 ${esc(id.maker || "-")}</span>`);
+  add(`<span class="chip">旧枪号 ${esc(id.legacy_no || "-")}</span>`);
+  if ((id.parts || []).length) add(`<span class="chip">散件 ${id.parts.length} 件</span>`);
+
+  renderScenario(d);
+  renderPipeline(d.pipeline || []);
+  renderLicenses(d.licenses || []);
+  renderInspections(d.inspections || []);
+  const tl = document.getElementById("arc-timeline");
+  tl.innerHTML = "";
+  if (d.timeline && d.timeline.length) makeTimelineTable("arc-timeline", d.timeline);
+  else tl.innerHTML = '<div class="empty">尚无链上事件</div>';
+}
+
+/* ---------------- 场景信息卡 ---------------- */
+function renderScenario(d) {
+  const box = document.getElementById("arc-scenario");
+  box.innerHTML = "";
+  const scen = d.scenario;
+  if (!scen) {
+    box.innerHTML = '<div class="empty">该枪支未归属五类业务场景</div>';
+    return;
+  }
+  const head = el("div", { class: "rec-head" },
+    el("h3", { style: "margin:0" }, "业务场景 · " + scen.name),
+    sourceBadge(scen.source));
+  box.appendChild(head);
+  const fields = scen.fields || [];
+  const info = scen.info || {};
+  const grid = el("div", { class: "detail-grid" });
+  const hasAny = fields.some(f => info[f]);
+  if (fields.length && !hasAny) {
+    grid.appendChild(el("span", { class: "k" }, "业务信息"));
+    grid.appendChild(el("span", {}, "（按单位类型推导，未登记场景明细）"));
+  }
+  for (const f of fields) {
+    grid.appendChild(el("span", { class: "k" }, f));
+    grid.appendChild(el("span", {}, info[f] || "-"));
+  }
+  box.appendChild(grid);
+  if (scen.evidence_no) {
+    const ev = el("div", { style: "margin-top:8px;font-size:12px;color:var(--muted)" });
+    ev.innerHTML = "场景存证编号 " + mono(scen.evidence_no).__html;
+    box.appendChild(ev);
+  }
+}
+
+/* ---------------- 主线节点 ---------------- */
+function renderPipeline(nodes) {
+  const box = document.getElementById("arc-pipeline");
+  box.innerHTML = "";
+  if (!nodes.length) { box.innerHTML = '<div class="empty">暂无节点</div>'; return; }
+  nodes.forEach((n, i) => {
+    const det = el("details", { class: "node" });
+    if (n.status === "办理中" || n.status === "退回补正") det.open = true;
+    const sum = el("summary");
+    sum.appendChild(el("span", { class: "node-idx" }, String(i + 1).padStart(2, "0")));
+    sum.appendChild(el("span", { class: "node-name" }, n.name));
+    const b = el("span"); b.innerHTML = stageBadge(n.status).__html; sum.appendChild(b);
+    sum.appendChild(el("span", { class: "node-scope" }, n.scope || "枪支级"));
+    sum.appendChild(el("span", { class: "node-scope" }, (n.records || []).length + " 条记录"));
+    if (n.note) sum.appendChild(el("span", { class: "node-note" }, n.note));
+    det.appendChild(sum);
+    const body = el("div", { class: "node-body" });
+    if (!n.records || !n.records.length) {
+      body.appendChild(el("div", { class: "empty" }, "该节点暂无办理记录"));
+    } else {
+      for (const rec of n.records) body.appendChild(renderRecord(rec));
+    }
+    det.appendChild(body);
+    box.appendChild(det);
+  });
+}
+
+function renderRecord(rec) {
+  const box = el("div", { class: "rec" });
+  const head = el("div", { class: "rec-head" });
+  head.appendChild(el("strong", {}, rec.matter || "-"));
+  const b1 = el("span"); b1.innerHTML = stageBadge(rec.status).__html; head.appendChild(b1);
+  const b2 = el("span"); b2.innerHTML = sourceBadge(rec.source).__html;
+  head.appendChild(b2);
+  box.appendChild(head);
+
+  const grid = el("div", { class: "detail-grid" });
+  const rows = [
+    ["申请单位", rec.applicant],
+    ["办理部门", rec.agency],
+    ["经办人", rec.handler],
+    ["办理时间", rec.at ? fmtTime(rec.at) : ""],
+    ["审批意见", rec.opinion],
+    ["证件及有效期", rec.license],
+    ["附件", (rec.attachments || []).length
+      ? (rec.attachments || []).map(x => (typeof x === "object" ? (x.signer || JSON.stringify(x)) : x)).join("、") : ""],
+    ["存证编号", rec.evidence_no],
+  ];
+  for (const [k, v] of rows) {
+    grid.appendChild(el("span", { class: "k" }, k));
+    const cell = el("span", {}, v || "-");
+    if (k === "存证编号" && v) cell.className = "mono";
+    grid.appendChild(cell);
+  }
+  box.appendChild(grid);
+
+  if (rec.steps && rec.steps.length) {
+    const chain = el("div", { class: "chain" });
+    for (const s of rec.steps) {
+      const row = el("div", { class: "step-row" });
+      row.appendChild(el("span", { class: "step-agency" },
+        s.agency_name + " · " + s.action));
+      const sb = el("span");
+      sb.innerHTML = stageBadge(s.status).__html;
+      row.appendChild(sb);
+      row.appendChild(el("span", { class: "step-op" },
+        (s.handler ? "经办 " + s.handler : "待办理")
+        + (s.at ? " · " + fmtTime(s.at) : "")));
+      if (s.opinion) row.appendChild(el("span", { class: "step-op" }, "「" + s.opinion + "」"));
+      chain.appendChild(row);
+    }
+    box.appendChild(chain);
+  }
+  return box;
+}
+
+/* ---------------- 证照 / 检查 ---------------- */
+function renderLicenses(lics) {
+  const box = document.getElementById("arc-licenses");
+  if (!lics.length) { box.innerHTML = '<div class="empty">暂无证照</div>'; return; }
+  renderTable(box, [
+    { key: "name", label: "证照名称" },
+    { key: "license_id", label: "编号", fmt: v => mono(v) },
+    { key: "holder_unit", label: "持证单位" },
+    { key: "agency_id", label: "核发部门" },
+    { key: "valid_to", label: "有效期至", fmt: v => fmtTime(v) },
+    { key: "status", label: "状态", fmt: (v, r) =>
+        v === "active" && r.valid_to >= new Date().toISOString()
+          ? badge("有效", "approved") : badge("已失效", "closed") },
+    { key: "source", label: "记录来源", fmt: v => sourceBadge(v) },
+  ], lics, "暂无证照记录");
+}
+
+function renderInspections(insps) {
+  const box = document.getElementById("arc-insp");
+  if (!insps.length) { box.innerHTML = '<div class="empty">暂无监督检查记录</div>'; return; }
+  renderTable(box, [
+    { key: "insp_id", label: "编号", fmt: v => mono(v) },
+    { key: "agency_name", label: "检查单位" },
+    { key: "target_unit", label: "被检查单位" },
+    { key: "findings", label: "问题", fmt: v => (v || []).join("；") },
+    { key: "deadline", label: "整改期限", fmt: v => v ? fmtTime(v) : "-" },
+    { key: "status_label", label: "状态", fmt: v => stageBadge(v) },
+    { key: "recheck_result", label: "复查结果", fmt: v => v || "-" },
+    { key: "source", label: "记录来源", fmt: v => sourceBadge(v) },
+  ], insps, "暂无监督检查记录");
+}
+
+boot();
+</script>
+</body>
+</html>

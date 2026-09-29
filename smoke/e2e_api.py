@@ -71,13 +71,13 @@ def main():
 
         # 总览 KPI
         ov = api(page, "/api/admin/overview")
-        log("总览API(在册枪支)", ov.get("gun_total") == 21, f"guns={ov.get('gun_total')}")
+        log("总览API(在册枪支)", ov.get("gun_total") == 25, f"guns={ov.get('gun_total')}")
         log("总览API(预警分级)", len(ov.get("alert_by_level", {})) >= 2,
             json.dumps(ov.get("alert_by_level"), ensure_ascii=False))
 
         # 台账
         guns = api(page, "/api/guns")
-        log("台账API(admin全量)", len(guns.get("items", [])) == 21)
+        log("台账API(admin全量)", len(guns.get("items", [])) == 25)
 
         # 运输审批
         permits = api(page, "/api/permits")

@@ -47,7 +47,7 @@ def main():
         pg.on("pageerror", lambda e: errs.append(str(e)))
         login(ctx, pg, "admin1", "admin123")
         body0 = pg.text_content("body")
-        for name, expect in (("枪支台账", "整枪码"), ("运输监管", "许可"),
+        for name, expect in (("一枪一档", "整枪码"), ("协同审批", "审批"),("运输监管", "许可"),
                              ("报废监督", "报废"), ("预警中心", "预警"),
                              ("一链查证", "证据")):
             click_tab(pg, name)

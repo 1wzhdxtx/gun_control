@@ -181,3 +181,10 @@ label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px
 .totp-big { font-family: Consolas, monospace; font-size: 20px; letter-spacing: 4px; color: var(--accent); }
 .totp-ok { color: var(--ok); }
 .totp-low { color: var(--warn); }
+
+/* ---------------- 一枪一档 / 协同审批 ---------------- */
+a.inline-link {
+  color: var(--accent); font-size: 12.5px; text-decoration: none;
+  border-bottom: 1px dashed var(--accent); white-space: nowrap;
+}
+a.inline-link:hover { border-bottom-style: solid; }
