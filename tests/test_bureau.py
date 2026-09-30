@@ -368,6 +368,71 @@ class TestPreconditions:
         assert b.require_sale([gun.code], "运输申报") is None
         _ = lic_buyer
 
+    def test_buyer_purchase_authorization_must_cover_guns(self, s0):
+        """P1-1：买方须有"覆盖本次枪支"的配购授权——证照类型对 ≠ 本次授权。"""
+        b = s0.bureau
+        gun_ok = _mk(s0, serial=21)      # 买方资质明确覆盖
+        gun_out = _mk(s0, serial=22)     # 不在买方资质范围
+        lic_seller = _issue(s0, "manufacture_license", "unit:mfg-a")["license_id"]
+        # 买方配置资质只覆盖 gun_ok（显式枪支清单）
+        _issue(s0, "unit_qualification", "unit:range-a", gun_codes=[gun_ok.code])
+        # 无配购审批：授权范围内的枪 → 登记成功
+        s1 = b.create_sale(sale_id="S-AUTH-1", seller_unit="unit:mfg-a",
+                           buyer_unit="unit:range-a", gun_codes=[gun_ok.code],
+                           license_id=lic_seller, note="授权范围内")
+        assert s1["sale_id"] == "S-AUTH-1"
+        # 评审复现：只引用卖方配售许可证、不填配购申请编号，
+        # 但枪支不在买方配购授权范围 → 拒绝
+        with pytest.raises(ValidationError, match="配购授权"):
+            b.create_sale(sale_id="S-AUTH-2", seller_unit="unit:mfg-a",
+                          buyer_unit="unit:range-a", gun_codes=[gun_out.code],
+                          license_id=lic_seller, note="授权范围外")
+        # 已批准且覆盖该枪的配购审批 → 放行
+        pa = _issue(s0, "hunt_config", "unit:range-a", gun_codes=[gun_out.code])
+        s2 = b.create_sale(sale_id="S-AUTH-3", seller_unit="unit:mfg-a",
+                           buyer_unit="unit:range-a", gun_codes=[gun_out.code],
+                           license_id=lic_seller, purchase_app_id=pa["app_id"])
+        assert s2["purchase_app_id"] == pa["app_id"]
+        # 配购审批的申请单位必须是买方（"买方本次配购授权"）
+        other_pa = _issue(s0, "hunt_config", "unit:mfg-a",
+                          gun_codes=[gun_out.code])
+        with pytest.raises(ValidationError, match="申请单位"):
+            b.create_sale(sale_id="S-AUTH-4", seller_unit="unit:mfg-a",
+                          buyer_unit="unit:range-a", gun_codes=[gun_out.code],
+                          license_id=lic_seller, purchase_app_id=other_pa["app_id"])
+
+    def test_sale_handover_transfers_ownership_and_events(self, s0):
+        """P1-2：配售登记即交接确认——归属过户 + 事件记录 + 查询视图同步。"""
+        b = s0.bureau
+        gun = _mk(s0, serial=31)
+        # 枪支在卖方（制造企业）库存名下
+        s0.repo.db.execute("UPDATE guns SET unit_id='unit:mfg-a' WHERE code=?",
+                           (gun.code,))
+        lic_seller = _issue(s0, "manufacture_license", "unit:mfg-a")["license_id"]
+        _issue(s0, "unit_qualification", "unit:range-a")   # 买方资质（不限枪支）
+        b.create_sale(sale_id="S-HAND", seller_unit="unit:mfg-a",
+                      buyer_unit="unit:range-a", gun_codes=[gun.code],
+                      license_id=lic_seller, note="交付登记", actor="u-rng")
+        # 业务台账：归属移交买方（此前仅新增配售记录，买方档案 403）
+        row = s0.repo.db.one("SELECT unit_id FROM guns WHERE code=?", (gun.code,))
+        assert row["unit_id"] == "unit:range-a"
+        # 事件记录：交接事件入链（带操作签名）
+        evs = s0.repo.events_of(gun.code)
+        assert evs[-1].event_type == "transfer"
+        assert evs[-1].payload["unit"] == "unit:range-a"
+        assert evs[-1].payload["from_unit"] == "unit:mfg-a"
+        assert evs[-1].signatures
+        # 查询视图：泵送后时间线与台账投影同步
+        s0.pump()
+        tl = s0.view.timeline(gun.code)
+        assert any(e["event_type"] == "transfer" for e in tl)
+        st = s0.view.db.one("SELECT unit FROM gun_state WHERE gun_code=?",
+                            (gun.code,))
+        assert st["unit"] == "unit:range-a"
+        # 证据核验：交接过户事件上链覆盖
+        rep = s0.evidence.verify_gun(gun.code)
+        assert rep.ok, rep.checks
+
     def test_license_required_before_manufacture(self, s0):
         b = s0.bureau
         with pytest.raises(ValidationError, match="前置条件未满足"):
@@ -551,6 +616,42 @@ class TestBorderModes:
 
 
 # ---------------------------------------------------------------------------
+# 5b. 运输许可归属：批准/起运/核销全流程保留 domain（评审 P1-3）
+# ---------------------------------------------------------------------------
+class TestPermitDomain:
+    def test_domain_survives_approve_depart_verify(self, s0):
+        """P1-3：许可归属写入列并在各保存点延续——批准后单位列表不丢许可。"""
+        gun = _mk(s0, serial=41)
+        s0.domain.request_transport_permit(
+            permit_id="PERMIT-T1", gun_codes=[gun.code], vehicle="云A·T9",
+            carrier="承运员", escort="押运员", applicant="u-rng",
+            valid_from="2026-04-01T00:00:00+00:00",
+            valid_end="2026-12-31T00:00:00+00:00",
+            origin="起点库", destination="终点库")
+        assert s0.repo.get_permit("PERMIT-T1")["domain"] == "unit:range-a"
+        # 批准：domain 不丢失（此前 get_permit 不读列 → 保存成空串）
+        s0.domain.approve_transport_permit(permit_id="PERMIT-T1", approver="u-rng")
+        p = s0.repo.get_permit("PERMIT-T1")
+        assert p["status"] == "approved" and p["domain"] == "unit:range-a"
+        col = s0.repo.db.one(
+            "SELECT domain FROM permits WHERE permit_id='PERMIT-T1'")
+        assert col["domain"] == "unit:range-a"
+        # 起运 → 核销：归属持续保留（单位许可列表按 domain 过滤不丢）
+        sig = s0.kms.sign("user:u-rng", b"transport:depart:PERMIT-T1")
+        s0.domain.start_transport(
+            permit_id="PERMIT-T1", gun_codes=[gun.code], vehicle="云A·T9",
+            carrier="承运员", escort="押运员",
+            signers=[{"signer": "u-rng", "role": "保管", "sig": sig}])
+        assert s0.repo.get_permit("PERMIT-T1")["domain"] == "unit:range-a"
+        s0.domain.verify_transport_arrival(permit_id="PERMIT-T1", verifier="u-rng")
+        p = s0.repo.get_permit("PERMIT-T1")
+        assert p["status"] == "closed" and p["domain"] == "unit:range-a"
+        col = s0.repo.db.one(
+            "SELECT domain FROM permits WHERE permit_id='PERMIT-T1'")
+        assert col["domain"] == "unit:range-a"
+
+
+# ---------------------------------------------------------------------------
 # 6. 一枪一档：主线节点 / 记录字段 / 场景 / 总览
 # ---------------------------------------------------------------------------
 class TestArchive:
@@ -672,6 +773,68 @@ class TestArchive:
         assert ent["status"] == "待办理"
         assert "失效" in ent["note"]
 
+    def test_archive_manufacturer_resolved_by_stable_id(self, s0):
+        """P2-5：identity 固化制造单位稳定 ID，配置单位枪支档案关联
+        制造企业的资质与生产计划（此前按名称反查失败返回 None）。"""
+        s0.register_unit("unit:mfg-yn", "云南西南机电制造有限公司",
+                         "manufacture", risk_level=2)
+        gun = s0.domain.manufacture(maker="云南西南", kind="手枪", year=2026,
+                                    serial=51, legacy_no="GA26-000051",
+                                    unit_id="unit:range-a",
+                                    part_categories=["枪管"], signer="u-rng")
+        # 赋码时固化稳定制造单位 ID（内存对象与落库往返一致）
+        assert gun.identity.maker_unit_id == "unit:mfg-yn"
+        got = s0.repo.get_gun(gun.code)
+        assert got.identity.maker_unit_id == "unit:mfg-yn"
+        # 制造企业资质 + 生产计划 → 配置单位枪支档案可见
+        lic = _issue(s0, "manufacture_license", "unit:mfg-yn")["license_id"]
+        plan_app = s0.bureau.apply(
+            matter="production_plan", applicant_unit="unit:mfg-yn",
+            materials=list(APPROVAL_RULES["production_plan"]["materials"]),
+            batch_ref="B-T1", planned_qty=3)
+        plan_app = s0.bureau.process(plan_app["app_id"], agency_id="police-city",
+                                     handler="admin1", action="approve")
+        arch = s0.bureau.archive(gun.code)
+        assert lic in [l["license_id"] for l in arch["licenses"]]
+        assert plan_app["app_id"] in [a["app_id"] for a in arch["applications"]]
+        ent = next(n for n in arch["pipeline"] if n["key"] == "enterprise")
+        assert ent["records"], ent
+
+
+# ---------------------------------------------------------------------------
+# 6b. 历史事项兼容：旧 enterprise_license 记录可渲染可办理（评审 P2-4）
+# ---------------------------------------------------------------------------
+class TestLegacyMatterCompat:
+    def test_legacy_enterprise_license_records_still_processable(self, s0):
+        """旧库 enterprise_license（规则已拆分删除）不 KeyError、可见、可办理，
+        且新实例 _migrate 做显式数据迁移——不靠清库解决。"""
+        b = s0.bureau
+        mats = list(APPROVAL_RULES["manufacture_license"]["materials"])
+        app = b.apply(matter="manufacture_license", applicant_unit="unit:mfg-a",
+                      materials=mats, app_id="APP-LEGACY-1")
+        # 模拟旧版数据库记录（热插入，迁移早已跑过）
+        b.db.execute("UPDATE bureau_apps SET matter='enterprise_license' "
+                     "WHERE app_id='APP-LEGACY-1'")
+        # 读取归一化：事项/链视图按现行规则渲染
+        got = b.get_app("APP-LEGACY-1")
+        assert got["matter"] == "manufacture_license"
+        assert got["chain"] and got["chain"][0]["agency"] == "police-national"
+        # 可见性过滤按归一化事项（警察组看得到）
+        vis = b.list_apps(matters=b.matters_of_group("police"))
+        assert "APP-LEGACY-1" in [a["app_id"] for a in vis]
+        # 办理不再 KeyError（评审复现路径）
+        got = b.process("APP-LEGACY-1", agency_id="police-national",
+                        handler="mps1", action="approve")
+        assert got["status"] == "approved" and got["license_id"]
+        # 数据迁移：新服务实例启动时把旧事项改挂现行规则
+        b.db.execute("UPDATE bureau_apps SET matter='enterprise_license' "
+                     "WHERE app_id='APP-LEGACY-1'")
+        b2 = BureauService(s0.repo, s0.clock, audit=s0.audit, domain=s0.domain)
+        raw = b2.db.one("SELECT matter, category FROM bureau_apps "
+                        "WHERE app_id='APP-LEGACY-1'")
+        assert raw["matter"] == "manufacture_license"
+        assert raw["category"] == APPROVAL_RULES["manufacture_license"]["category"]
+
 
 # ---------------------------------------------------------------------------
 # 7. 持久化：重启后审批、检查、场景仍可追溯
@@ -763,6 +926,25 @@ class TestBureauAPI:
         assert [x["key"] for x in ov["stages"]] == list(PIPELINE_KEYS)
         # 总览须部门权限（gun:read:all domain=""）
         assert api["unit-hunt"].get("/api/bureau/overview").status_code == 403
+
+    def test_sale_requires_covering_purchase_authorization(self, api):
+        """P1-1 评审复现（排在扩展买方证照的用例之前，保持种子状态）：
+        狩猎场配购申请处于"退回补正"，制造单位只引用自己的配售许可证、
+        不填配购申请编号 → 拒绝（此前 200 成功）。"""
+        uncovered = _no_sale_guns()
+        assert uncovered, "种子应包含故意未登记配售的枪支（hunt_g2）"
+        code = uncovered[0]
+        sale_lic = next(l for l in SYSTEM.bureau.licenses("mfg-yn")
+                        if l["license_type"] == "sale_license")
+        r = api["unit-hunt"].post("/api/bureau/sales", json={
+            "seller_unit": "mfg-yn", "buyer_unit": "hunt-a",
+            "gun_codes": [code],
+            "license_id": sale_lic["license_id"],
+            "note": "仅引用卖方配售许可证"})
+        assert r.status_code == 400, r.text
+        assert "配购授权" in r.json()["detail"]
+        # 登记确实未落库（枪支仍无配售记录）
+        assert not any(code in s["gun_codes"] for s in SYSTEM.bureau.sales())
 
     def test_chain_processed_by_each_agency(self, api):
         """协同审批：哪个部门办理 → 逐节点办理，越权 403，最终核发证照。"""

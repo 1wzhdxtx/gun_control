@@ -133,6 +133,8 @@ class Ledger:
         "status_change": [],
         "permit": [],
         "alert": [],
+        # 配售交接（归属过户，评审 P1-2）：台账字段迁移，无业务合约可重判
+        "transfer": [],
     }
 
     def _execute_contracts(self, event: dict) -> list:

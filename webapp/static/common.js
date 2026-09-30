@@ -59,7 +59,7 @@ const PERMIT_STATUS = { applied: "已申请", approved: "已批准", in_transit:
 const EVENT_TYPE = {
   manufacture: "制造赋码", checkout: "领用", return: "归还", transport: "携运",
   repair: "维修", scrap: "报废", permit: "许可", alert: "预警",
-  status_change: "状态变更", use: "使用",
+  status_change: "状态变更", use: "使用", transfer: "配售交接",
 };
 const UNIT_TYPE = {
   manufacture: "制造企业", distributor: "配售企业", shooting_range: "营业性射击场",

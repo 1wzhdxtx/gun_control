@@ -6,13 +6,14 @@ DOMAIN 写入(DB+Outbox) → RELAY → MQ → ADAPTER → CONTRACT/LEDGER
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from .audit import AuditLog
 from .bus import ChainAdapter, EventBus, OutboxRelay
 from .bureau import BureauService
 from .chain import Ledger
-from .common import Clock, IntegrityError, ValidationError
+from .common import Clock, IntegrityError, ValidationError, canonical
 from .contracts import ContractRegistry
 from .crypto import CA, KMS, LocalVault
 from .domain import DomainRepository, DomainService, Unit, Person
@@ -128,7 +129,8 @@ class GunSystem:
         self.domain = DomainService(self.repo, self.outbox, self.registry,
                                     self.kms, self.ca, self.audit, self.clock, self.vault)
         # 跨部门协同审批 + 一枪一档（持久化在业务库，重启后仍可追溯）
-        self.bureau = BureauService(self.repo, self.clock, audit=self.audit)
+        self.bureau = BureauService(self.repo, self.clock, audit=self.audit,
+                                    domain=self.domain)
         # QUERY 取证
         self.evidence = EvidenceService(self.repo, self.view, self.ledger, self.registry)
 
@@ -139,6 +141,46 @@ class GunSystem:
         self.kms.create_key("adapter-01", owner="adapter", purpose="node")
         self.kms.create_key("chain-signer", owner="chain", purpose="node")
         self._receipts: list[dict] = []
+        # 链恢复：账本是进程内状态，gun_events 事件日志才是权威记录。
+        # 服务重启（或跨进程复用数据库）后必须从事件日志重放，
+        # 否则「一链查证」的 coverage 恒缺开机前的全部事件。
+        self.chain_recovered, self.chain_recover_failures = self._recover_chain()
+
+    # -- 链恢复：从事件日志重放已确认事件 ------------------------------------
+    def _recover_chain(self) -> tuple[int, list[str]]:
+        """进程启动时把 gun_events 全量重放进内存账本（交易体与适配器一致、幂等）。
+
+        不经事件总线：视图（stats_daily 等）已在首次上链时更新过，
+        重放视图会重复计数；恢复只补账本本身。
+        """
+        recovered, failed = 0, []
+        for row in self.repo.db.query("SELECT event_id, data FROM gun_events ORDER BY rowid"):
+            try:
+                ev = json.loads(row["data"])
+            except (TypeError, ValueError):
+                failed.append(row["event_id"])
+                continue
+            if not isinstance(ev, dict) or not ev.get("event_id"):
+                failed.append(row["event_id"])
+                continue
+            # 数据域缺省逻辑与 _submit_to_chain 保持一致
+            if not ev.get("domain"):
+                ev["domain"] = (ev.get("payload") or {}).get("unit") or ev.get("gun_code", "")[:7]
+            tx_body = {
+                "client_tx_id": ev["event_id"],
+                "event": ev,
+                "member": (ev.get("payload") or {}).get("unit") or None,
+                "submitted_at": self.clock.now_iso(),
+                "adapter": "adapter-01",
+            }
+            tx = {**tx_body,
+                  "sig": self.kms.sign("adapter-01", canonical(tx_body).encode("utf-8"))}
+            rc = self.ledger.append_tx(tx)
+            if rc.get("status") == "committed" and not rc.get("duplicate"):
+                recovered += 1
+            else:
+                failed.append(ev["event_id"])
+        return recovered, failed
 
     # -- Outbox 事件 → 链适配器（提交签名交易） -----------------------------
     def _submit_to_chain(self, msg) -> None:

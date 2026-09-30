@@ -310,6 +310,10 @@ def _seed_bureau(sys: GunSystem, clock: DemoClock) -> None:
             "持枪证件与出境事由有效，批准携运（待海关出境申报登记）")
 
     # ---- 配售记录（覆盖除 L2 外的全部枪支；运输/领用的前置条件）
+    # 交接过户的操作主体 = 各卖方演示管理员账号（持有签名密钥）
+    seller_actor = {"mfg-yn": "unit-mfg", "range-a": "unit-rng",
+                    "sport-a": "unit-spt"}
+
     def sale(sale_id: str, seller: str, buyer: str, guns: list[str],
              scenario: str, note: str, license_id: str = "",
              purchase_app_id: str = "") -> None:
@@ -319,7 +323,8 @@ def _seed_bureau(sys: GunSystem, clock: DemoClock) -> None:
         b.create_sale(sale_id=sale_id, seller_unit=seller, buyer_unit=buyer,
                       gun_codes=guns, scenario=scenario, note=note,
                       license_id=license_id,
-                      purchase_app_id=purchase_app_id, source="demo")
+                      purchase_app_id=purchase_app_id, source="demo",
+                      actor=seller_actor.get(seller, ""))
 
     lic_range = b.get_app("APP-2026-003")["license_id"]
     lic_sport = b.get_app("APP-2026-004")["license_id"]

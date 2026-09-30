@@ -212,7 +212,11 @@ class DomainRepository:
         if not r:
             return None
         d = json.loads(r["data"])
-        d.update({"permit_id": r["permit_id"], "kind": r["kind"], "status": r["status"]})
+        d.update({"permit_id": r["permit_id"], "kind": r["kind"],
+                  "status": r["status"],
+                  # 归属随许可全生命周期保留（评审 P1-3：批准/起运/核销
+                  # 不得把 domain 读丢或写空，否则单位许可列表按归属过滤时丢失）
+                  "domain": r["domain"] or d.get("domain", "")})
         return d
 
     # alerts
@@ -334,8 +338,16 @@ class DomainService:
             raise ValidationError(f"整枪码重复: {code}")
         parts = [str(PartCode.generate(code, cat, i + 1))
                  for i, cat in enumerate(part_categories or [])]
+        # 制造单位稳定 ID（评审 P2-5）：优先按企业名称匹配在册单位并在赋码时固化；
+        # 匹配不到时，赋码单位本身是制造企业则以其为准，否则留空（不虚报制造主体）。
+        mrow = self.repo.db.one(
+            "SELECT unit_id FROM units WHERE name LIKE ? ORDER BY unit_id",
+            (maker + "%",))
+        maker_unit_id = (mrow["unit_id"] if mrow else
+                         (unit_id if unit.unit_type == "manufacture" else ""))
         ident = GunIdentity(code=code, maker=maker, kind=kind, year=year, serial=serial,
-                            legacy_no=legacy_no, parts=parts)
+                            legacy_no=legacy_no, parts=parts,
+                            maker_unit_id=maker_unit_id)
         gun = Gun(code=code, unit_id=unit_id, status="in_stock", identity=ident)
         ev = build_event(
             event_id=gen_id("evt"), gun_code=code, event_type="manufacture",
@@ -564,7 +576,9 @@ class DomainService:
             ["transport_permit", "spacetime"], ctx))
 
         p["status"] = "in_transit"
-        self.repo.save_permit(permit_id, "transport", "in_transit", p, "")
+        # 起运保存保留原归属（评审 P1-3）
+        self.repo.save_permit(permit_id, "transport", "in_transit", p,
+                              p.get("domain", ""))
         events = []
         for code in gun_codes:
             gun = self.repo.get_gun(code)
@@ -603,7 +617,9 @@ class DomainService:
         self.registry.raise_all(self.registry.evaluate_all(
             ["transport_permit", "spacetime"], ctx))
         p["status"] = "closed"
-        self.repo.save_permit(permit_id, "transport", "closed", p, "")
+        # 核销保存保留原归属（评审 P1-3）
+        self.repo.save_permit(permit_id, "transport", "closed", p,
+                              p.get("domain", ""))
         for code in p["gun_codes"]:
             gun = self.repo.get_gun(code)
             ev = build_event(
@@ -620,6 +636,47 @@ class DomainService:
                 conn.execute("UPDATE guns SET status='in_stock' WHERE code=?", (code,))
         self.audit.append(actor=verifier, action="transport:verify", target=permit_id)
         return p
+
+    # -- 配售交接（评审 P1-2） -----------------------------------------------
+    def handover(self, *, gun_codes: list[str], from_unit: str, to_unit: str,
+                 actor: str, ref_id: str, location: str = "") -> list[GunEvent]:
+        """配售交接确认：枪支归属移交买方（登记即交付完成）。
+
+        同步更新三处：业务台账（guns.unit_id/domain）、查询视图（事件投影
+        gun_state.unit）、事件记录（gun_events + Outbox 上链）。此前只新增
+        配售记录不过户，买方访问本枪档案被 403。
+        """
+        if from_unit == to_unit or not gun_codes:
+            return []
+        to_unit_row = self.repo.get_unit(to_unit)
+        events: list[GunEvent] = []
+        for code in dict.fromkeys(gun_codes):
+            gun = self.repo.get_gun(code)
+            if gun.unit_id != from_unit:
+                continue                      # 归属已在买方/他方，无需过户
+            ev = build_event(
+                event_id=gen_id("evt"), gun_code=code, event_type="transfer",
+                actor=actor, occurred_at=self.clock.now_iso(),
+                location=location or to_unit, device_id="handover",
+                payload={"unit": to_unit, "from_unit": from_unit,
+                         "holder": gun.holder, "ref": ref_id,
+                         "stage": "handover"},
+                signer_ids=[actor])
+            # 操作主体有签名密钥则实签名；单位代录等无密钥主体保留占位
+            # （与 alert 等系统事件一致，哈希链与上链覆盖不受影响）
+            if self.kms.has_key(f"user:{actor}"):
+                ev.signatures[actor] = self.kms.sign(
+                    f"user:{actor}", ev.event_hash.encode())
+            with self.repo.db.transaction() as conn:
+                self._emit(conn, ev, gun)
+                conn.execute("UPDATE guns SET unit_id=?, domain=? WHERE code=?",
+                             (to_unit, to_unit_row.domain or to_unit, code))
+            events.append(ev)
+        if events:
+            self.audit.append(actor=actor, action="gun:handover", target=ref_id,
+                              detail={"guns": [e.gun_code for e in events],
+                                      "from": from_unit, "to": to_unit})
+        return events
 
     # -- 4. 维修 -------------------------------------------------------------
     def repair(self, *, gun_code: str, actor: str, content: str,

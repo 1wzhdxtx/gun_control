@@ -12,7 +12,8 @@ from .common import ValidationError
 
 EVENT_TYPES = ("checkout", "return", "transport", "use", "repair", "scrap")
 # 扩展：制造赋码、状态变更等基础事件（作为链的起点/状态记录）
-BASE_EVENT_TYPES = ("manufacture", "status_change", "alert", "permit")
+# transfer = 配售交接（归属过户，评审 P1-2），属基础事件不重判业务合约
+BASE_EVENT_TYPES = ("manufacture", "status_change", "alert", "permit", "transfer")
 
 ALL_EVENT_TYPES = EVENT_TYPES + BASE_EVENT_TYPES
 

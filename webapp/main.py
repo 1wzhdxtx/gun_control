@@ -913,7 +913,9 @@ async def bureau_sale_create(request: Request, payload: dict = Body(...)):
         scenario=payload.get("scenario", ""),
         license_id=payload.get("license_id", ""),
         purchase_app_id=payload.get("purchase_app_id", ""),
-        note=payload.get("note", ""), source="real")
+        note=payload.get("note", ""), source="real", actor=sub.user_id)
+    # 配售登记含交接过户事件：泵送入链，查询视图（gun_state/timeline）即时更新
+    SYSTEM.pump(rounds=200)
     return {"ok": True, "sale": sale}
 
 

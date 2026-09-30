@@ -127,12 +127,15 @@ class GunIdentity:
     serial: int
     legacy_no: str = ""  # 现行 GA1258 枪号（映射关系）
     parts: list[str] = field(default_factory=list)
+    # 制造单位稳定 ID（赋码时固化）：档案按 ID 关联制造企业资质与生产计划，
+    # 不依赖企业名称反查（名称可能改、可能与单位名不一致——评审 P2-5）
+    maker_unit_id: str = ""
 
     def to_dict(self) -> dict:
         return {
             "code": self.code, "maker": self.maker, "kind": self.kind,
             "year": self.year, "serial": self.serial, "legacy_no": self.legacy_no,
-            "parts": list(self.parts),
+            "parts": list(self.parts), "maker_unit_id": self.maker_unit_id,
         }
 
     @staticmethod

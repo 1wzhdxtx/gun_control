@@ -11,10 +11,7 @@ from gunreg import GunSystem, ManualClock
 from gunreg.common import ContractRejected
 
 
-@pytest.fixture()
-def sys0():
-    clock = ManualClock()
-    s = GunSystem(clock=clock)
+def _setup(s: GunSystem) -> GunSystem:
     s.register_unit("unit:range-a", "某营业性射击场", "shooting_range", risk_level=2)
     s.register_person("p-keeper", "保管员", "unit:range-a", duty="保管",
                       cert_kinds=["手枪"], cert_expire="2027-12-31T00:00:00+00:00")
@@ -29,6 +26,11 @@ def sys0():
     s.identity.register("u-super", "监督员", "unit", "unit:range-a", "pw2")
     s.identity.register("u-police", "民警", "admin", "police:sd", "pw3")
     return s
+
+
+@pytest.fixture()
+def sys0():
+    return _setup(GunSystem(clock=ManualClock()))
 
 
 def _mk_gun(s: GunSystem, serial: int = 1, kind: str = "手枪"):
@@ -154,3 +156,29 @@ class TestViewRebuild:
         report2 = s.evidence.verify_gun(gun.code)
         assert not report2.ok
         assert not report2.checks["evidence_match"]["ok"]
+
+
+class TestChainRecovery:
+    def test_chain_recovered_after_restart(self, tmp_path):
+        """账本为进程内状态：重启后必须从事件日志重放恢复。
+
+        否则跨进程/重启后「一链查证」的 coverage 恒缺开机前的全部事件
+        （e2e 冒烟的证据核验必挂）。
+        """
+        db = str(tmp_path / "gunreg.sqlite3")
+        view = str(tmp_path / "view.sqlite3")
+        s1 = _setup(GunSystem(clock=ManualClock(), db_path=db, view_path=view))
+        gun = _mk_gun(s1)
+        s1.domain.checkout(gun_code=gun.code, person_id="p-keeper",
+                           signers=_checkout_sigs(s1, gun.code, "p-keeper"),
+                           device_verified=True, due_hours=8)
+        s1.pump()
+        assert s1.evidence.verify_gun(gun.code).ok
+
+        # 重启新实例共享同一业务库：账本从 gun_events 全量恢复
+        s2 = GunSystem(clock=ManualClock(), db_path=db, view_path=view)
+        assert s2.chain_recovered >= 2
+        assert not s2.chain_recover_failures
+        assert len(s2.ledger.txs()) >= 2
+        rep = s2.evidence.verify_gun(gun.code)
+        assert rep.ok, rep.checks

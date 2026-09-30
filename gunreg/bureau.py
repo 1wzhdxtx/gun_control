@@ -21,7 +21,6 @@ import re
 from datetime import timedelta
 
 from .common import NotFoundError, PermissionDenied, StateError, ValidationError, hash_obj
-from .identity import MAKERS
 
 # ---------------------------------------------------------------------------
 # 部门登记（可配置：名称、分组、辖区）
@@ -323,13 +322,26 @@ def _loads(text, default):
     return default if v is None else v
 
 
+# 历史事项归一化（评审 P2-4）：enterprise_license 已拆分为
+# manufacture_license / sale_license。旧库未办结记录不能因此卡死——
+# _migrate() 做数据迁移，读取路径用 _matter_of() 归一化兜底（热插入的
+# 旧记录也能直接办理），两条防线都不依赖清库。
+LEGACY_MATTERS = {"enterprise_license": "manufacture_license"}
+
+
+def _matter_of(matter: str) -> str:
+    """历史事项代码 → 当前规则代码（未知代码原样返回）。"""
+    return LEGACY_MATTERS.get(matter, matter)
+
+
 class BureauService:
     """跨部门协同审批 + 一枪一档档案（数据全部持久化在业务库）。"""
 
-    def __init__(self, repo, clock, audit=None):
+    def __init__(self, repo, clock, audit=None, domain=None):
         self.repo = repo
         self.clock = clock
         self.audit = audit
+        self.domain = domain          # 领域服务（配售交接过户用）
         self.db = repo.db
         self.db.executescript(SCHEMA)
         self._migrate()
@@ -347,6 +359,12 @@ class BureauService:
             for name, ddl in cols.items():
                 if name not in have:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        # 数据迁移：旧事项代码改挂现行规则（材料/证照/链按新规则渲染）
+        for old, new in LEGACY_MATTERS.items():
+            if new in APPROVAL_RULES:
+                self.db.execute(
+                    "UPDATE bureau_apps SET matter=?, category=? WHERE matter=?",
+                    (new, APPROVAL_RULES[new]["category"], old))
 
     # ------------------------------------------------------------------ 基础
     def _now(self) -> str:
@@ -446,7 +464,8 @@ class BureauService:
         rows = self.db.query("SELECT * FROM bureau_apps ORDER BY created_at DESC, rowid DESC")
         out = []
         for r in rows:
-            if matters is not None and r["matter"] not in matters:
+            # 事项过滤按归一化后的代码（旧 enterprise_license 记录对部门可见）
+            if matters is not None and _matter_of(r["matter"]) not in matters:
                 continue
             if applicant_unit is not None and r["applicant_unit"] != applicant_unit:
                 continue
@@ -689,7 +708,7 @@ class BureauService:
     def create_sale(self, *, sale_id: str, seller_unit: str, buyer_unit: str,
                     gun_codes: list[str], scenario: str = "", license_id: str = "",
                     purchase_app_id: str = "", note: str = "", status: str = "delivered",
-                    source: str = "real") -> dict:
+                    source: str = "real", actor: str = "") -> dict:
         if not gun_codes:
             raise ValidationError("配售记录须关联至少一支枪支")
         if not seller_unit or not buyer_unit:
@@ -711,19 +730,22 @@ class BureauService:
         #    配置方须持配置资质或配购证件；同单位场内登记须持有效证照。
         seller_types = self._active_license_types(seller_unit)
         buyer_types = self._active_license_types(buyer_unit)
+        # 买方"本次配购授权"可接受的证照类型（与资质校验同一集合，步骤 6 复用）
+        buyer_auth_types = {"unit_qualification", "purchase_permit", "task_license"}
+        if seller_unit == buyer_unit:
+            buyer_auth_types |= {"mfg_license", "sale_license"}
         if seller_unit != buyer_unit:
             if not {"mfg_license", "sale_license"} & seller_types:
                 raise ValidationError(
                     f"前置条件未满足：配售方 {seller_unit} 须持有效的"
                     "《民用枪支制造许可证》或《民用枪支配售许可证》，"
                     "请先在「协同审批」办理对应许可事项。")
-            if not {"unit_qualification", "purchase_permit", "task_license"} & buyer_types:
+            if not buyer_auth_types & buyer_types:
                 raise ValidationError(
                     f"前置条件未满足：配置方 {buyer_unit} 须持有效配置资质或"
                     "民用枪支配购证件，请先完成配购审批。")
         else:
-            if not {"unit_qualification", "purchase_permit", "task_license",
-                    "mfg_license", "sale_license"} & seller_types:
+            if not buyer_auth_types & seller_types:
                 raise ValidationError(
                     f"前置条件未满足：场内配售配购登记须持有效证照（{seller_unit}）。")
         # 4) 关联证照：必填、有效、由当事方持有、覆盖所配售枪支，
@@ -774,6 +796,26 @@ class BureauService:
                 raise ValidationError(
                     f"配购审批 {purchase_app_id} 未覆盖本次配售枪支："
                     f"{'、'.join(pa_guns)}")
+            if pa["applicant_unit"] != buyer_unit:
+                raise ValidationError(
+                    f"配购审批 {purchase_app_id} 的申请单位为 "
+                    f"{pa['applicant_unit']}，非配置方 {buyer_unit}——"
+                    "买方本次配购授权须由配置方提出配购申请。")
+        else:
+            # 6) 买方本次配购授权（评审 P1-1）：未提供配购审批编号时，
+            #    买方须持"覆盖本次枪支"的有效配购类证照——不能仅凭
+            #    "持有任意符合类型证照"放行（证照类型对 ≠ 本次授权覆盖）。
+            covering = [l for l in self.licenses(buyer_unit)
+                        if l["license_type"] in buyer_auth_types
+                        and l["status"] == "active"
+                        and (l["valid_to"] or "") >= now
+                        and (not l["gun_codes"]
+                             or set(gun_codes) <= set(l["gun_codes"]))]
+            if not covering:
+                raise ValidationError(
+                    f"前置条件未满足：配置方 {buyer_unit} 缺少覆盖本次枪支的"
+                    "配购授权——须提供已批准且覆盖枪支的配购审批编号，"
+                    "或持有覆盖本次枪支的有效配置资质/配购证件/任务持枪证。")
         now = self._now()
         ev = self._ev("EV", {"sale": sale_id, "guns": gun_codes})
         self.db.execute(
@@ -782,8 +824,27 @@ class BureauService:
             "created_at,domain) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (sale_id, scenario, seller_unit, buyer_unit, license_id, purchase_app_id,
              _js(gun_codes), status, note, ev, source, now, seller_unit))
-        self._log(seller_unit, "bureau:sale", sale_id, {"guns": len(gun_codes)})
+        self._log(actor or seller_unit, "bureau:sale", sale_id,
+                  {"guns": len(gun_codes)})
+        # 交接确认（评审 P1-2）：配售登记即交付完成——枪支归属移交买方，
+        # 业务台账（guns.unit_id）、查询视图与事件记录同步更新。
+        if status == "delivered":
+            self._handover(sale_id=sale_id, seller_unit=seller_unit,
+                           buyer_unit=buyer_unit, gun_codes=gun_codes,
+                           actor=actor or seller_unit)
         return self.get_sale(sale_id)
+
+    def _handover(self, *, sale_id: str, seller_unit: str, buyer_unit: str,
+                  gun_codes: list[str], actor: str) -> None:
+        """交接确认节点：经领域服务过户并落事件（无领域服务时仅更新台账）。"""
+        if self.domain is not None:
+            self.domain.handover(gun_codes=gun_codes, from_unit=seller_unit,
+                                 to_unit=buyer_unit, actor=actor, ref_id=sale_id)
+            return
+        for c in dict.fromkeys(gun_codes):
+            self.db.execute(
+                "UPDATE guns SET unit_id=? WHERE code=? AND unit_id=?",
+                (buyer_unit, c, seller_unit))
 
     def sales(self) -> list[dict]:
         rows = self.db.query("SELECT * FROM bureau_sales ORDER BY created_at DESC, rowid DESC")
@@ -946,7 +1007,7 @@ class BureauService:
         events = [e.to_dict() for e in self.repo.events_of(gun_code)]
         permits = self._permits_of(gun_code)
         sales = self.sales_of(gun_code)
-        maker_unit = self._maker_unit(identity.get("maker", ""))
+        maker_unit = self._maker_unit(identity)
         unit_ids = [u for u in dict.fromkeys([row["unit_id"], maker_unit]) if u]
         # 一枪一档：逐枪直接关联的申请 + 赋码之前的企业级申请
         # （资质审批/计划备案按所属企业关联，不按枪支编号关联）
@@ -992,19 +1053,23 @@ class BureauService:
                 out.append(data)
         return out
 
-    def _maker_unit(self, maker_code: str) -> str | None:
-        """整枪码企业代码 → 注册企业单位（演示企业名与单位名对应）。"""
-        maker_name = next((n for n, c in MAKERS.items() if c == maker_code), "")
-        if not maker_name:
+    def _maker_unit(self, identity: dict) -> str | None:
+        """制造单位：以身份固化的稳定单位 ID 为准（评审 P2-5）；
+        旧数据（无 maker_unit_id）回退按企业名称匹配在册单位。"""
+        uid = (identity.get("maker_unit_id") or "").strip()
+        if uid and self.db.one("SELECT unit_id FROM units WHERE unit_id=?", (uid,)):
+            return uid
+        maker = (identity.get("maker") or "").strip()
+        if not maker:
             return None
-        row = self.db.one("SELECT unit_id FROM units WHERE name LIKE ?",
-                          (maker_name + "%",))
+        row = self.db.one("SELECT unit_id FROM units WHERE name LIKE ? ORDER BY unit_id",
+                          (maker + "%",))
         return row["unit_id"] if row else None
 
     def _pipeline(self, gun_row, unit, identity, events, permits, sales, apps,
                   inspections, licenses) -> list[dict]:
         manu_unit = gun_row["unit_id"]
-        maker_unit = self._maker_unit(identity.get("maker", ""))
+        maker_unit = self._maker_unit(identity)
         unit_ids = [u for u in dict.fromkeys([manu_unit, maker_unit]) if u]
 
         # 1. 企业资质与计划（企业级：赋码后关联到本枪，不随单枪重复审批）
@@ -1330,6 +1395,9 @@ class BureauService:
     # ------------------------------------------------------------ 视图解码
     def _app_view(self, row: dict) -> dict:
         d = dict(row)
+        # 历史事项归一化（评审 P2-4）：热插入的旧 enterprise_license 记录
+        # 也要能渲染规则链、按现行规则办理（resubmit/process 不再 KeyError）
+        d["matter"] = _matter_of(d.get("matter", ""))
         d["gun_codes"] = _loads(d.get("gun_codes"), [])
         d["materials"] = _loads(d.get("materials"), [])
         d["missing"] = _loads(d.get("missing"), [])
